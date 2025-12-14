@@ -4,6 +4,17 @@ project(blast VERSION 0.3 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default to Release build if not specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Validate build type
+set(allowed_build_types Debug Release RelWithDebInfo MinSizeRel)
+if(NOT CMAKE_BUILD_TYPE IN_LIST allowed_build_types)
+    message(FATAL_ERROR "Invalid CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}. Must be one of: ${allowed_build_types}")
+endif()
+
 # Place executable in project root
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
 
