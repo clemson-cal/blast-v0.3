@@ -104,6 +104,8 @@ static inline auto plm_gradient(vec_t<T, N> yl, vec_t<T, N> yc, vec_t<T, N> yr, 
 // SR Hydrodynamics functions
 // =============================================================================
 
+static constexpr double four_pi = 1.0;
+
 static auto gamma_beta_squared(prim_t p) -> double {
     return p[1] * p[1];
 }
@@ -230,17 +232,16 @@ static auto max_wavespeed(prim_t p) -> double {
 static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> cons_t {
     // Eqn A8 in Zhang & MacFadyen (2006), integrated over the spherical shell
     // between r0 and r1, and specializing to radial velocity only.
+    // Source = 4π p (r1² - r0²) to match the area-integrated fluxes
     auto pg = p[2];
     auto dr2 = std::pow(r1, 2) - std::pow(r0, 2);
-    auto srdot = pg * dr2;
+    auto srdot = four_pi * pg * dr2;
     return cons_t{0.0, srdot, 0.0};
 }
 
 // =============================================================================
 // Spherical geometry
 // =============================================================================
-
-static constexpr double four_pi = 4.0 * M_PI;
 
 struct grid_t {
     double r0 = 0.0;  // inner radius of domain
@@ -591,7 +592,8 @@ struct update_conserved_t {
             auto rl = p.grid.face_radius(i);
             auto rr = p.grid.face_radius(i + 1);
             auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
-            p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt + source * dt;
+            p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt;
+            p.cons[i] += source * dt;
         });
         p.time += p.dt;
         return p;
