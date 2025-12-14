@@ -363,7 +363,7 @@ struct patch_t {
 
     cached_t<cons_t, 1> cons;
     cached_t<cons_t, 1> cons_rk;  // RK cached state
-    cached_t<prim_t, 1> prim;     // primitive variables at cell centers
+    mutable cached_t<prim_t, 1> prim;  // primitive variables at cell centers
     cached_t<prim_t, 1> grad;     // PLM gradients at cell centers
     cached_t<cons_t, 1> fhat;     // Godunov fluxes at faces
 
@@ -882,11 +882,14 @@ auto get_product(
 ) -> srhd::product_t {
     using std::views::transform;
 
-    // Helper to get primitive at cell i (divides volume-integrated cons by cell volume)
-    auto get_prim = [](const auto& p, int i) {
-        auto dv = p.grid.cell_volume(i);
-        return cons_to_prim(p.cons[i] / dv);
-    };
+    // Ensure prim is up-to-date
+    for (const auto& p : state.patches) {
+        for_each(p.interior, [&](ivec_t<1> idx) {
+            auto i = idx[0];
+            auto dv = p.grid.cell_volume(i);
+            p.prim[i] = cons_to_prim(p.cons[i] / dv);
+        });
+    }
 
     auto make_product = [&](auto f) {
         return to_vector(state.patches | transform([f](const auto& p) {
@@ -897,16 +900,16 @@ auto get_product(
     };
 
     if (name == "density") {
-        return make_product([get_prim](const auto& p, int i) { return get_prim(p, i)[0]; });
+        return make_product([](const auto& p, int i) { return p.prim[i][0]; });
     }
     if (name == "velocity") {
-        return make_product([get_prim](const auto& p, int i) { return beta(get_prim(p, i)); });
+        return make_product([](const auto& p, int i) { return beta(p.prim[i]); });
     }
     if (name == "pressure") {
-        return make_product([get_prim](const auto& p, int i) { return get_prim(p, i)[2]; });
+        return make_product([](const auto& p, int i) { return p.prim[i][2]; });
     }
     if (name == "lorentz_factor") {
-        return make_product([get_prim](const auto& p, int i) { return lorentz_factor(get_prim(p, i)); });
+        return make_product([](const auto& p, int i) { return lorentz_factor(p.prim[i]); });
     }
     if (name == "cell_r") {
         return make_product([](const auto& p, int i) { return p.grid.cell_radius(i); });
