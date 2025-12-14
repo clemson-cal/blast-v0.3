@@ -403,7 +403,7 @@ struct initial_state_t {
     }
 };
 
-struct compute_local_dt_t {
+struct local_dt_t {
     static constexpr const char* name = "compute_local_dt";
     double cfl;
     grid_t grid;
@@ -459,8 +459,8 @@ struct global_dt_t {
     }
 };
 
-struct ghost_exchange_t {
-    static constexpr const char* name = "ghost_exchange";
+struct exchange_cons_guard_t {
+    static constexpr const char* name = "exchange_cons_guard";
     using space_t = index_space_t<1>;
     using buffer_t = array_view_t<cons_t, 1>;
 
@@ -482,7 +482,7 @@ struct ghost_exchange_t {
     }
 };
 
-struct apply_boundary_conditions_t {
+struct apply_cons_boundary_conditions_t {
     static constexpr const char* name = "apply_bc";
     boundary_condition bc_lo;
     boundary_condition bc_hi;
@@ -778,14 +778,14 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
 
     auto new_step = parallel::pipeline(
         cons_to_prim_t{},
-        compute_local_dt_t{cfg.cfl, grid, cfg.plm_theta},
+        local_dt_t{cfg.cfl, grid, cfg.plm_theta},
         global_dt_t{},
         cache_rk_t{}
     );
 
     auto euler_step = parallel::pipeline(
-        ghost_exchange_t{},
-        apply_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones},
+        exchange_cons_guard_t{},
+        apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones},
         cons_to_prim_t{},
         compute_gradients_t{},
         compute_fluxes_t{},

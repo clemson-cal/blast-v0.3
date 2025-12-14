@@ -1,4 +1,4 @@
-set initial num_zones=20000 ic=uniform
+set initial num_zones=2000 ic=wind
 set physics rk_order=2 bc_lo=inflow bc_hi=inflow
 set output=binary
 repeat 0.01 t show message
