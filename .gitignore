@@ -5,8 +5,9 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 
-# Executable
+# Executables
 blast
+srhd1d
 
 # Editor
 *.swp

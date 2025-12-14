@@ -1,6 +1,6 @@
 /**
 ================================================================================
-Copyright 2023 - 2025, Jonathan Zrake
+Copyright 2023 - 2025, Jonathan Zrake and Benjamin Amend
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,6 @@ SOFTWARE.
 ================================================================================
 */
 
-#include <cassert>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -227,44 +226,13 @@ static auto max_wavespeed(prim_t p) -> double {
     return max2(std::fabs(ws[0]), std::fabs(ws[1]));
 }
 
-static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> cons_t {
-    // Eqn A8 in Zhang & MacFadyen (2006), integrated over the spherical shell
-    // between r0 and r1, and specializing to radial velocity only.
-    auto pg = p[2];
-    auto dr2 = std::pow(r1, 2) - std::pow(r0, 2);
-    auto srdot = pg * dr2;
-    return cons_t{0.0, srdot, 0.0};
+// =============================================================================
+// Helper functions
+// =============================================================================
+
+static auto cell_center_x(int i, double dx) -> double {
+    return (i + 0.5) * dx;
 }
-
-// =============================================================================
-// Spherical geometry
-// =============================================================================
-
-static constexpr double four_pi = 4.0 * M_PI;
-
-struct grid_t {
-    double r0 = 0.0;  // inner radius of domain
-    double dr = 0.0;  // radial zone spacing
-
-    auto face_radius(int i) const -> double {
-        return r0 + i * dr;
-    }
-
-    auto cell_radius(int i) const -> double {
-        return r0 + (i + 0.5) * dr;
-    }
-
-    auto face_area(int i) const -> double {
-        auto r = face_radius(i);
-        return four_pi * r * r;
-    }
-
-    auto cell_volume(int i) const -> double {
-        auto rl = face_radius(i);
-        auto rr = face_radius(i + 1);
-        return four_pi / 3.0 * (rr * rr * rr - rl * rl * rl);
-    }
-};
 
 // =============================================================================
 // Initial conditions
@@ -273,8 +241,7 @@ struct grid_t {
 enum class initial_condition {
     sod,
     blast_wave,
-    wind,
-    uniform
+    wind
 };
 
 auto to_string(initial_condition ic) -> const char* {
@@ -282,7 +249,6 @@ auto to_string(initial_condition ic) -> const char* {
         case initial_condition::sod: return "sod";
         case initial_condition::blast_wave: return "blast_wave";
         case initial_condition::wind: return "wind";
-        case initial_condition::uniform: return "uniform";
     }
     return "unknown";
 }
@@ -291,34 +257,27 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     if (s == "sod") return initial_condition::sod;
     if (s == "blast_wave") return initial_condition::blast_wave;
     if (s == "wind") return initial_condition::wind;
-    if (s == "uniform") return initial_condition::uniform;
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
-static auto initial_primitive(initial_condition ic, double r) -> prim_t {
+static auto initial_primitive(initial_condition ic, double x, double L) -> prim_t {
     switch (ic) {
         case initial_condition::sod:
-            if (r < 1.0) {
+            if (x < 0.5 * L) {
                 return prim_t{1.0, 0.0, 1.0};
             } else {
                 return prim_t{0.125, 0.0, 0.1};
             }
         case initial_condition::blast_wave:
-            if (r < 1.0) {
+            if (x < 0.5 * L) {
                 return prim_t{1.0, 0.0, 1000.0};
             } else {
                 return prim_t{1.0, 0.0, 0.01};
             }
-        case initial_condition::wind: {
-            auto rho = 1.0 / (r * r);
-            auto u = 1.0;  // gamma-beta = 1.0
-            auto pre = 1e-6 * rho;
-            return prim_t{rho, u, pre};
-        }
-        case initial_condition::uniform:
-            return prim_t{1.0, 0.0, 1.0};
+        case initial_condition::wind:
+            return prim_t{1.0, 1.0, 0.01};
     }
-    assert(false);
+    return prim_t{1.0, 0.0, 1.0};
 }
 
 // =============================================================================
@@ -327,23 +286,23 @@ static auto initial_primitive(initial_condition ic, double r) -> prim_t {
 
 enum class boundary_condition {
     outflow,
-    inflow,
-    reflecting
+    reflecting,
+    periodic
 };
 
 auto to_string(boundary_condition bc) -> const char* {
     switch (bc) {
         case boundary_condition::outflow: return "outflow";
-        case boundary_condition::inflow: return "inflow";
         case boundary_condition::reflecting: return "reflecting";
+        case boundary_condition::periodic: return "periodic";
     }
     return "unknown";
 }
 
 auto from_string(std::type_identity<boundary_condition>, const std::string& s) -> boundary_condition {
     if (s == "outflow") return boundary_condition::outflow;
-    if (s == "inflow") return boundary_condition::inflow;
     if (s == "reflecting") return boundary_condition::reflecting;
+    if (s == "periodic") return boundary_condition::periodic;
     throw std::runtime_error("unknown boundary condition: " + s);
 }
 
@@ -354,7 +313,7 @@ auto from_string(std::type_identity<boundary_condition>, const std::string& s) -
 struct patch_t {
     index_space_t<1> interior;
 
-    grid_t grid;
+    double dx = 0.0;
     double dt = 0.0;
     double time = 0.0;
     double time_rk = 0.0;
@@ -385,18 +344,15 @@ struct patch_t {
 
 struct initial_state_t {
     static constexpr const char* name = "initial_state";
-    grid_t grid;
+    double dx;
+    double L;
     initial_condition ic;
 
     auto value(patch_t p) const -> patch_t {
-        p.grid = grid;
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rc = grid.cell_radius(i);
-            auto dv = grid.cell_volume(i);
-            auto prim = initial_primitive(ic, rc);
-            auto cons = prim_to_cons(prim);
-            p.cons[i] = cons * dv;
+            auto x = cell_center_x(i, dx);
+            p.cons[i] = prim_to_cons(initial_primitive(ic, x, L));
         });
         return p;
     }
@@ -405,17 +361,17 @@ struct initial_state_t {
 struct compute_local_dt_t {
     static constexpr const char* name = "compute_local_dt";
     double cfl;
-    grid_t grid;
+    double dx;
     double plm_theta;
 
     auto value(patch_t p) const -> patch_t {
-        p.grid = grid;
+        p.dx = dx;
         p.plm_theta = plm_theta;
 
         auto wavespeeds = lazy(p.interior, [&p](ivec_t<1> i) {
             return max_wavespeed(p.prim(i));
         });
-        p.dt = cfl * grid.dr / max(wavespeeds);
+        p.dt = cfl * dx / max(wavespeeds);
         return p;
     }
 };
@@ -434,8 +390,7 @@ struct cons_to_prim_t {
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.prim), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto dv = p.grid.cell_volume(i);
-            p.prim[i] = cons_to_prim(p.cons[i] / dv);
+            p.prim[i] = cons_to_prim(p.cons[i]);
         });
         return p;
     }
@@ -485,37 +440,28 @@ struct apply_boundary_conditions_t {
     static constexpr const char* name = "apply_bc";
     boundary_condition bc_lo;
     boundary_condition bc_hi;
-    initial_condition ic;
     unsigned num_zones;  // global domain size
 
     auto value(patch_t p) const -> patch_t {
         auto i0 = start(p.interior)[0];
         auto i1 = upper(p.interior)[0] - 1;
-        auto& grid = p.grid;
 
         // Left boundary (patch starts at global origin)
         if (i0 == 0) {
             switch (bc_lo) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0] / grid.cell_volume(i0));
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g);
-                    }
-                    break;
-                case boundary_condition::inflow:
-                    for (int g = 0; g < 2; ++g) {
-                        auto i = i0 - 1 - g;
-                        auto r = grid.cell_radius(i);
-                        auto prim = initial_primitive(ic, r);
-                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i);
+                        p.cons[i0 - 1 - g] = p.cons[i0];
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0 + g] / grid.cell_volume(i0 + g));
-                        prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g);
+                        auto u = p.cons[i0 + g];
+                        p.cons[i0 - 1 - g] = cons_t{u[0], -u[1], u[2]};
                     }
+                    break;
+                case boundary_condition::periodic:
+                    // Handled by ghost exchange
                     break;
             }
         }
@@ -525,24 +471,17 @@ struct apply_boundary_conditions_t {
             switch (bc_hi) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1] / grid.cell_volume(i1));
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g);
-                    }
-                    break;
-                case boundary_condition::inflow:
-                    for (int g = 0; g < 2; ++g) {
-                        auto i = i1 + 1 + g;
-                        auto r = grid.cell_radius(i);
-                        auto prim = initial_primitive(ic, r);
-                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i);
+                        p.cons[i1 + 1 + g] = p.cons[i1];
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1 - g] / grid.cell_volume(i1 - g));
-                        prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g);
+                        auto u = p.cons[i1 - g];
+                        p.cons[i1 + 1 + g] = cons_t{u[0], -u[1], u[2]};
                     }
+                    break;
+                case boundary_condition::periodic:
+                    // Handled by ghost exchange
                     break;
             }
         }
@@ -554,14 +493,10 @@ struct compute_gradients_t {
     static constexpr const char* name = "compute_gradients";
     auto value(patch_t p) const -> patch_t {
         auto plm_theta = p.plm_theta;
+
         for_each(space(p.grad), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            p.grad[i] = plm_gradient(
-                p.prim[i - 1],
-                p.prim[i + 0],
-                p.prim[i + 1],
-                plm_theta
-            );
+            p.grad[i] = plm_gradient(p.prim[i - 1], p.prim[i], p.prim[i + 1], plm_theta);
         });
         return p;
     }
@@ -572,10 +507,12 @@ struct compute_fluxes_t {
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.fhat), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto da = p.grid.face_area(i);
+
+            // Reconstruct left and right states at face i
             auto pl = p.prim[i - 1] + p.grad[i - 1] * 0.5;
-            auto pr = p.prim[i + 0] - p.grad[i + 0] * 0.5;
-            p.fhat[i] = riemann_hlle(pl, pr, prim_to_cons(pl), prim_to_cons(pr)) * da;
+            auto pr = p.prim[i] - p.grad[i] * 0.5;
+
+            p.fhat[i] = riemann_hlle(pl, pr, prim_to_cons(pl), prim_to_cons(pr));
         });
         return p;
     }
@@ -584,14 +521,11 @@ struct compute_fluxes_t {
 struct update_conserved_t {
     static constexpr const char* name = "update_conserved";
     auto value(patch_t p) const -> patch_t {
-        auto dt = p.dt;
+        auto dtdx = p.dt / p.dx;
 
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rl = p.grid.face_radius(i);
-            auto rr = p.grid.face_radius(i + 1);
-            auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
-            p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt + source * dt;
+            p.cons[i] = p.cons[i] + (p.fhat[i] - p.fhat[i + 1]) * dtdx;
         });
         p.time += p.dt;
         return p;
@@ -645,6 +579,7 @@ struct srhd {
         int rk_order = 1;
         double cfl = 0.4;
         double plm_theta = 1.5;
+        initial_condition ic = initial_condition::sod;
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
 
@@ -653,6 +588,7 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
+                field("ic", ic),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -663,6 +599,7 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
+                field("ic", ic),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -672,17 +609,13 @@ struct srhd {
     struct initial_t {
         unsigned int num_zones = 400;
         unsigned int num_partitions = 1;
-        double inner_radius = 0.0;
-        double outer_radius = 1.0;
-        initial_condition ic = initial_condition::uniform;
+        double domain_length = 1.0;
 
         auto fields() const {
             return std::make_tuple(
                 field("num_zones", num_zones),
                 field("num_partitions", num_partitions),
-                field("inner_radius", inner_radius),
-                field("outer_radius", outer_radius),
-                field("ic", ic)
+                field("domain_length", domain_length)
             );
         }
 
@@ -690,9 +623,7 @@ struct srhd {
             return std::make_tuple(
                 field("num_zones", num_zones),
                 field("num_partitions", num_partitions),
-                field("inner_radius", inner_radius),
-                field("outer_radius", outer_radius),
-                field("ic", ic)
+                field("domain_length", domain_length)
             );
         }
     };
@@ -747,7 +678,7 @@ auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
 }
 
 auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
-    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .ic = initial_condition::uniform};
+    return {.num_zones = 400, .num_partitions = 1, .domain_length = 1.0};
 }
 
 auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
@@ -758,13 +689,14 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
     auto& cfg = ctx.config;
     auto np = static_cast<int>(ini.num_partitions);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
-    auto grid = grid_t{ini.inner_radius, (ini.outer_radius - ini.inner_radius) / ini.num_zones};
+    auto dx = ini.domain_length / ini.num_zones;
+    auto L = ini.domain_length;
 
     auto patches = to_vector(iota(0, np) | transform([&](int p) {
         return patch_t(subspace(S, np, p, 0));
     }));
 
-    ctx.execute(patches, initial_state_t{grid, ini.ic});
+    ctx.execute(patches, initial_state_t{dx, L, cfg.ic});
 
     return {std::move(patches), 0.0};
 }
@@ -772,18 +704,18 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
 void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
     auto& ini = ctx.initial;
     auto& cfg = ctx.config;
-    auto grid = grid_t{ini.inner_radius, (ini.outer_radius - ini.inner_radius) / ini.num_zones};
+    auto dx = ini.domain_length / ini.num_zones;
 
     auto new_step = parallel::pipeline(
         cons_to_prim_t{},
-        compute_local_dt_t{cfg.cfl, grid, cfg.plm_theta},
+        compute_local_dt_t{cfg.cfl, dx, cfg.plm_theta},
         global_dt_t{},
         cache_rk_t{}
     );
 
     auto euler_step = parallel::pipeline(
         ghost_exchange_t{},
-        apply_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones},
+        apply_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.num_zones},
         cons_to_prim_t{},
         compute_gradients_t{},
         compute_fluxes_t{},
@@ -828,7 +760,7 @@ auto names_of_timeseries(std::type_identity<srhd>) -> std::vector<std::string> {
 }
 
 auto names_of_products(std::type_identity<srhd>) -> std::vector<std::string> {
-    return {"density", "velocity", "pressure", "lorentz_factor", "cell_r"};
+    return {"density", "velocity", "pressure", "lorentz_factor", "cell_x"};
 }
 
 auto get_time(const srhd::state_t& state, const std::string& name) -> double {
@@ -848,18 +780,16 @@ auto get_timeseries(
         return state.time;
     }
 
+    auto dx = ini.domain_length / ini.num_zones;
     auto total_mass = 0.0;
     auto total_energy = 0.0;
     auto max_lorentz = 1.0;
 
     for (const auto& p : state.patches) {
-        // cons stores volume-integrated quantities, so total_mass = sum of cons[0]
-        auto mass = lazy(p.interior, [&p](ivec_t<1> i) { return p.cons[i[0]][0]; });
-        auto energy = lazy(p.interior, [&p](ivec_t<1> i) { return p.cons[i[0]][2]; });
-        auto lorentz = lazy(p.interior, [&p](ivec_t<1> idx) {
-            auto i = idx[0];
-            auto dv = p.grid.cell_volume(i);
-            return lorentz_factor(cons_to_prim(p.cons[i] / dv));
+        auto mass = lazy(p.interior, [&p, dx](ivec_t<1> i) { return p.cons[i[0]][0] * dx; });
+        auto energy = lazy(p.interior, [&p, dx](ivec_t<1> i) { return p.cons[i[0]][2] * dx; });
+        auto lorentz = lazy(p.interior, [&p](ivec_t<1> i) {
+            return lorentz_factor(cons_to_prim(p.cons[i[0]]));
         });
         total_mass += sum(mass);
         total_energy += sum(energy);
@@ -880,11 +810,7 @@ auto get_product(
 ) -> srhd::product_t {
     using std::views::transform;
 
-    // Helper to get primitive at cell i (divides volume-integrated cons by cell volume)
-    auto get_prim = [](const auto& p, int i) {
-        auto dv = p.grid.cell_volume(i);
-        return cons_to_prim(p.cons[i] / dv);
-    };
+    auto dx = ctx.initial.domain_length / ctx.initial.num_zones;
 
     auto make_product = [&](auto f) {
         return to_vector(state.patches | transform([f](const auto& p) {
@@ -895,19 +821,19 @@ auto get_product(
     };
 
     if (name == "density") {
-        return make_product([get_prim](const auto& p, int i) { return get_prim(p, i)[0]; });
+        return make_product([](const auto& p, int i) { return cons_to_prim(p.cons[i])[0]; });
     }
     if (name == "velocity") {
-        return make_product([get_prim](const auto& p, int i) { return beta(get_prim(p, i)); });
+        return make_product([](const auto& p, int i) { return beta(cons_to_prim(p.cons[i])); });
     }
     if (name == "pressure") {
-        return make_product([get_prim](const auto& p, int i) { return get_prim(p, i)[2]; });
+        return make_product([](const auto& p, int i) { return cons_to_prim(p.cons[i])[2]; });
     }
     if (name == "lorentz_factor") {
-        return make_product([get_prim](const auto& p, int i) { return lorentz_factor(get_prim(p, i)); });
+        return make_product([](const auto& p, int i) { return lorentz_factor(cons_to_prim(p.cons[i])); });
     }
-    if (name == "cell_r") {
-        return make_product([](const auto& p, int i) { return p.grid.cell_radius(i); });
+    if (name == "cell_x") {
+        return make_product([dx](const auto&, int i) { return cell_center_x(i, dx); });
     }
     throw std::runtime_error("unknown product: " + name);
 }

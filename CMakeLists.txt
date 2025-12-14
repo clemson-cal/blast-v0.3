@@ -15,3 +15,7 @@ endif()
 add_executable(blast src/blast.cpp)
 target_include_directories(blast PRIVATE ${CMAKE_SOURCE_DIR}/mist/include)
 target_link_libraries(blast PRIVATE ${READLINE_LIB})
+
+add_executable(srhd1d src/srhd1d.cpp)
+target_include_directories(srhd1d PRIVATE ${CMAKE_SOURCE_DIR}/mist/include)
+target_link_libraries(srhd1d PRIVATE ${READLINE_LIB})
