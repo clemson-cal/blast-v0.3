@@ -1,0 +1,8 @@
+set initial num_zones=200
+init
+repeat 0.01 t show message
+t += 0.2
+select products
+write products
+show profiler
+stop

@@ -1,0 +1,27 @@
+# Build
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Executable
+blast
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Output files
+*.h5
+*.dat
+*.bin
+
+# Python
+.venv

@@ -1,0 +1,3 @@
+[submodule "mist"]
+	path = mist
+	url = git@github.com:clemson-cal/mist.git
