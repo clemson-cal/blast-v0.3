@@ -244,25 +244,44 @@ static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> c
 // =============================================================================
 
 struct grid_t {
-    double r0 = 0.0;  // inner radius of domain
-    double dr = 0.0;  // radial zone spacing
+    double r0_initial = 0.0;  // inner radius at t=0
+    double r1_initial = 0.0;  // outer radius at t=0
+    double v_inner = 0.0;     // inner boundary velocity
+    double v_outer = 0.0;     // outer boundary velocity
+    unsigned num_zones = 0;
 
-    auto face_radius(int i) const -> double {
-        return r0 + i * dr;
+    auto inner_radius(double t) const -> double {
+        return r0_initial + v_inner * t;
     }
 
-    auto cell_radius(int i) const -> double {
-        return r0 + (i + 0.5) * dr;
+    auto outer_radius(double t) const -> double {
+        return r1_initial + v_outer * t;
     }
 
-    auto face_area(int i) const -> double {
-        auto r = face_radius(i);
+    auto dr(double t) const -> double {
+        return (outer_radius(t) - inner_radius(t)) / num_zones;
+    }
+
+    auto face_radius(int i, double t) const -> double {
+        return inner_radius(t) + i * dr(t);
+    }
+
+    auto cell_radius(int i, double t) const -> double {
+        return inner_radius(t) + (i + 0.5) * dr(t);
+    }
+
+    auto face_velocity(int i) const -> double {
+        return v_inner + (v_outer - v_inner) * i / num_zones;
+    }
+
+    auto face_area(int i, double t) const -> double {
+        auto r = face_radius(i, t);
         return four_pi * r * r;
     }
 
-    auto cell_volume(int i) const -> double {
-        auto rl = face_radius(i);
-        auto rr = face_radius(i + 1);
+    auto cell_volume(int i, double t) const -> double {
+        auto rl = face_radius(i, t);
+        auto rr = face_radius(i + 1, t);
         return four_pi / 3.0 * (rr * rr * rr - rl * rl * rl);
     }
 };
@@ -393,8 +412,8 @@ struct initial_state_t {
         p.grid = grid;
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rc = grid.cell_radius(i);
-            auto dv = grid.cell_volume(i);
+            auto rc = grid.cell_radius(i, 0.0);
+            auto dv = grid.cell_volume(i, 0.0);
             auto prim = initial_primitive(ic, rc);
             auto cons = prim_to_cons(prim);
             p.cons[i] = cons * dv;
@@ -416,7 +435,9 @@ struct local_dt_t {
         auto wavespeeds = lazy(p.interior, [&p](ivec_t<1> i) {
             return max_wavespeed(p.prim(i));
         });
-        p.dt = cfl * grid.dr / max(wavespeeds);
+        // Account for mesh motion: max face velocity magnitude
+        auto max_vface = max2(std::fabs(grid.v_inner), std::fabs(grid.v_outer));
+        p.dt = cfl * grid.dr(p.time) / (max(wavespeeds) + max_vface);
         return p;
     }
 };
@@ -435,7 +456,7 @@ struct cons_to_prim_t {
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.prim), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto dv = p.grid.cell_volume(i);
+            auto dv = p.grid.cell_volume(i, p.time);
             p.prim[i] = cons_to_prim(p.cons[i] / dv);
         });
         return p;
@@ -493,29 +514,30 @@ struct apply_cons_boundary_conditions_t {
         auto i0 = start(p.interior)[0];
         auto i1 = upper(p.interior)[0] - 1;
         auto& grid = p.grid;
+        auto t = p.time;
 
         // Left boundary (patch starts at global origin)
         if (i0 == 0) {
             switch (bc_lo) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0] / grid.cell_volume(i0));
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g);
+                        auto prim = cons_to_prim(p.cons[i0] / grid.cell_volume(i0, t));
+                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g, t);
                     }
                     break;
                 case boundary_condition::inflow:
                     for (int g = 0; g < 2; ++g) {
                         auto i = i0 - 1 - g;
-                        auto r = grid.cell_radius(i);
+                        auto r = grid.cell_radius(i, t);
                         auto prim = initial_primitive(ic, r);
-                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i);
+                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i, t);
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0 + g] / grid.cell_volume(i0 + g));
+                        auto prim = cons_to_prim(p.cons[i0 + g] / grid.cell_volume(i0 + g, t));
                         prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g);
+                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * grid.cell_volume(i0 - 1 - g, t);
                     }
                     break;
             }
@@ -526,23 +548,23 @@ struct apply_cons_boundary_conditions_t {
             switch (bc_hi) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1] / grid.cell_volume(i1));
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g);
+                        auto prim = cons_to_prim(p.cons[i1] / grid.cell_volume(i1, t));
+                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g, t);
                     }
                     break;
                 case boundary_condition::inflow:
                     for (int g = 0; g < 2; ++g) {
                         auto i = i1 + 1 + g;
-                        auto r = grid.cell_radius(i);
+                        auto r = grid.cell_radius(i, t);
                         auto prim = initial_primitive(ic, r);
-                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i);
+                        p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i, t);
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1 - g] / grid.cell_volume(i1 - g));
+                        auto prim = cons_to_prim(p.cons[i1 - g] / grid.cell_volume(i1 - g, t));
                         prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g);
+                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * grid.cell_volume(i1 + 1 + g, t);
                     }
                     break;
             }
@@ -573,10 +595,11 @@ struct compute_fluxes_t {
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.fhat), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto da = p.grid.face_area(i);
+            auto da = p.grid.face_area(i, p.time);
+            auto vf = p.grid.face_velocity(i);
             auto pl = p.prim[i - 1] + p.grad[i - 1] * 0.5;
             auto pr = p.prim[i + 0] - p.grad[i + 0] * 0.5;
-            p.fhat[i] = riemann_hlle(pl, pr, prim_to_cons(pl), prim_to_cons(pr)) * da;
+            p.fhat[i] = riemann_hlle(pl, pr, prim_to_cons(pl), prim_to_cons(pr), vf) * da;
         });
         return p;
     }
@@ -586,11 +609,12 @@ struct update_conserved_t {
     static constexpr const char* name = "update_conserved";
     auto value(patch_t p) const -> patch_t {
         auto dt = p.dt;
+        auto t = p.time;
 
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rl = p.grid.face_radius(i);
-            auto rr = p.grid.face_radius(i + 1);
+            auto rl = p.grid.face_radius(i, t);
+            auto rr = p.grid.face_radius(i + 1, t);
             auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
             p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt;
             p.cons[i] += source * dt;
@@ -647,6 +671,8 @@ struct srhd {
         int rk_order = 1;
         double cfl = 0.4;
         double plm_theta = 1.5;
+        double v_inner = 0.0;  // inner boundary face velocity
+        double v_outer = 0.0;  // outer boundary face velocity
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
 
@@ -655,6 +681,8 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
+                field("v_inner", v_inner),
+                field("v_outer", v_outer),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -665,6 +693,8 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
+                field("v_inner", v_inner),
+                field("v_outer", v_outer),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -760,7 +790,13 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
     auto& cfg = ctx.config;
     auto np = static_cast<int>(ini.num_partitions);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
-    auto grid = grid_t{ini.inner_radius, (ini.outer_radius - ini.inner_radius) / ini.num_zones};
+    auto grid = grid_t{
+        ini.inner_radius,
+        ini.outer_radius,
+        cfg.v_inner,
+        cfg.v_outer,
+        ini.num_zones
+    };
 
     auto patches = to_vector(iota(0, np) | transform([&](int p) {
         return patch_t(subspace(S, np, p, 0));
@@ -774,7 +810,13 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
 void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
     auto& ini = ctx.initial;
     auto& cfg = ctx.config;
-    auto grid = grid_t{ini.inner_radius, (ini.outer_radius - ini.inner_radius) / ini.num_zones};
+    auto grid = grid_t{
+        ini.inner_radius,
+        ini.outer_radius,
+        cfg.v_inner,
+        cfg.v_outer,
+        ini.num_zones
+    };
 
     auto new_step = parallel::pipeline(
         cons_to_prim_t{},
@@ -860,7 +902,7 @@ auto get_timeseries(
         auto energy = lazy(p.interior, [&p](ivec_t<1> i) { return p.cons[i[0]][2]; });
         auto lorentz = lazy(p.interior, [&p](ivec_t<1> idx) {
             auto i = idx[0];
-            auto dv = p.grid.cell_volume(i);
+            auto dv = p.grid.cell_volume(i, p.time);
             return lorentz_factor(cons_to_prim(p.cons[i] / dv));
         });
         total_mass += sum(mass);
@@ -886,7 +928,7 @@ auto get_product(
     for (const auto& p : state.patches) {
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto dv = p.grid.cell_volume(i);
+            auto dv = p.grid.cell_volume(i, p.time);
             p.prim[i] = cons_to_prim(p.cons[i] / dv);
         });
     }
@@ -912,7 +954,7 @@ auto get_product(
         return make_product([](const auto& p, int i) { return lorentz_factor(p.prim[i]); });
     }
     if (name == "cell_r") {
-        return make_product([](const auto& p, int i) { return p.grid.cell_radius(i); });
+        return make_product([](const auto& p, int i) { return p.grid.cell_radius(i, p.time); });
     }
     throw std::runtime_error("unknown product: " + name);
 }
