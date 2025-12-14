@@ -1,4 +1,4 @@
-set initial num_zones=200
+set initial num_zones=2000
 init
 repeat 0.01 t show message
 t += 0.2

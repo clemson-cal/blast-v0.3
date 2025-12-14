@@ -1,0 +1,11 @@
+set initial num_zones=20000 ic=uniform
+set physics rk_order=1 bc_lo=inflow bc_hi=inflow
+set output=binary
+repeat 0.01 t show message
+select products
+show all
+init
+n += 100
+write products
+show profiler
+stop
