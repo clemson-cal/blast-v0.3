@@ -35,6 +35,7 @@ SOFTWARE.
 #include "mist/ndarray.hpp"
 #include "mist/pipeline.hpp"
 #include "mist/serialize.hpp"
+#include "riemann_two_shock.hpp"
 
 using namespace mist;
 
@@ -294,7 +295,8 @@ enum class initial_condition {
     sod,
     blast_wave,
     wind,
-    uniform
+    uniform,
+    four_state
 };
 
 auto to_string(initial_condition ic) -> const char* {
@@ -303,6 +305,7 @@ auto to_string(initial_condition ic) -> const char* {
         case initial_condition::blast_wave: return "blast_wave";
         case initial_condition::wind: return "wind";
         case initial_condition::uniform: return "uniform";
+        case initial_condition::four_state: return "four_state";
     }
     return "unknown";
 }
@@ -312,10 +315,11 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     if (s == "blast_wave") return initial_condition::blast_wave;
     if (s == "wind") return initial_condition::wind;
     if (s == "uniform") return initial_condition::uniform;
+    if (s == "four_state") return initial_condition::four_state;
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
-static auto initial_primitive(initial_condition ic, double r) -> prim_t {
+static auto initial_primitive(initial_condition ic, double r, double tstart = 0.0) -> prim_t {
     switch (ic) {
         case initial_condition::sod:
             if (r < 1.0) {
@@ -337,6 +341,42 @@ static auto initial_primitive(initial_condition ic, double r) -> prim_t {
         }
         case initial_condition::uniform:
             return prim_t{1.0, 0.0, 1.0};
+        case initial_condition::four_state: {
+            // Converging cold flow: left moves right, right moves left
+            constexpr double dl = 1.0;
+            constexpr double ul = 1.0;   // four-velocity, moving right
+            constexpr double dr = 1.0;
+            constexpr double ur = -1.0;  // four-velocity, moving left
+            constexpr double p_cold = 1e-6;
+
+            // Solve two-shock Riemann problem
+            auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
+
+            // Compute shock and contact velocities
+            auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
+            double g_contact = std::sqrt(1.0 + sol.u * sol.u);
+            double v_cd = sol.u / g_contact;
+
+            // Positions at tstart (shocks launched from r=1.0)
+            double r_rs = 1.0 + v_rs * tstart;  // reverse shock position
+            double r_cd = 1.0 + v_cd * tstart;  // contact position
+            double r_fs = 1.0 + v_fs * tstart;  // forward shock position
+
+            // Determine which region r falls into
+            if (r < r_rs) {
+                // Region 4: original left state
+                return prim_t{dl, ul, p_cold * dl};
+            } else if (r < r_cd) {
+                // Region 3: shocked left material
+                return prim_t{sol.d3, sol.u, sol.p};
+            } else if (r < r_fs) {
+                // Region 2: shocked right material
+                return prim_t{sol.d2, sol.u, sol.p};
+            } else {
+                // Region 1: original right state
+                return prim_t{dr, ur, p_cold * dr};
+            }
+        }
     }
     assert(false);
 }
@@ -407,6 +447,7 @@ struct initial_state_t {
     static constexpr const char* name = "initial_state";
     grid_t grid;
     initial_condition ic;
+    double tstart;
 
     auto value(patch_t p) const -> patch_t {
         p.grid = grid;
@@ -414,7 +455,7 @@ struct initial_state_t {
             auto i = idx[0];
             auto rc = grid.cell_radius(i, 0.0);
             auto dv = grid.cell_volume(i, 0.0);
-            auto prim = initial_primitive(ic, rc);
+            auto prim = initial_primitive(ic, rc, tstart);
             auto cons = prim_to_cons(prim);
             p.cons[i] = cons * dv;
         });
@@ -509,6 +550,7 @@ struct apply_cons_boundary_conditions_t {
     boundary_condition bc_hi;
     initial_condition ic;
     unsigned num_zones;  // global domain size
+    double tstart;
 
     auto value(patch_t p) const -> patch_t {
         auto i0 = start(p.interior)[0];
@@ -529,7 +571,7 @@ struct apply_cons_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i0 - 1 - g;
                         auto r = grid.cell_radius(i, t);
-                        auto prim = initial_primitive(ic, r);
+                        auto prim = initial_primitive(ic, r, tstart);
                         p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i, t);
                     }
                     break;
@@ -556,7 +598,7 @@ struct apply_cons_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i1 + 1 + g;
                         auto r = grid.cell_radius(i, t);
-                        auto prim = initial_primitive(ic, r);
+                        auto prim = initial_primitive(ic, r, tstart);
                         p.cons[i] = prim_to_cons(prim) * grid.cell_volume(i, t);
                     }
                     break;
@@ -722,6 +764,7 @@ struct srhd {
         unsigned int num_partitions = 1;
         double inner_radius = 0.0;
         double outer_radius = 1.0;
+        double tstart = 0.0;
         initial_condition ic = initial_condition::uniform;
 
         auto fields() const {
@@ -730,6 +773,7 @@ struct srhd {
                 field("num_partitions", num_partitions),
                 field("inner_radius", inner_radius),
                 field("outer_radius", outer_radius),
+                field("tstart", tstart),
                 field("ic", ic)
             );
         }
@@ -740,6 +784,7 @@ struct srhd {
                 field("num_partitions", num_partitions),
                 field("inner_radius", inner_radius),
                 field("outer_radius", outer_radius),
+                field("tstart", tstart),
                 field("ic", ic)
             );
         }
@@ -795,7 +840,7 @@ auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
 }
 
 auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
-    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .ic = initial_condition::uniform};
+    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .tstart = 0.0, .ic = initial_condition::uniform};
 }
 
 auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
@@ -817,7 +862,7 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
         return patch_t(subspace(S, np, p, 0));
     }));
 
-    ctx.execute(patches, initial_state_t{grid, ini.ic});
+    ctx.execute(patches, initial_state_t{grid, ini.ic, ini.tstart});
 
     return {std::move(patches), 0.0};
 }
@@ -842,7 +887,7 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
 
     auto euler_step = parallel::pipeline(
         exchange_cons_guard_t{},
-        apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones},
+        apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones, ini.tstart},
         cons_to_prim_t{},
         compute_gradients_t{},
         compute_edge_velocities_t{},
