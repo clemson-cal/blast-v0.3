@@ -1,11 +1,10 @@
-set initial num_zones=2000 ic=wind
+set initial num_zones=2000 inner_radius=1.0 outer_radius=2.0 ic=wind
 set physics rk_order=2 bc_lo=inflow bc_hi=inflow
 set output=binary
 repeat 0.01 t show message
-select products
-show all
 init
-t -> 0.1
+t -> 1.0
+show all
+select products
 write products
-show profiler
 stop

@@ -1,5 +1,12 @@
-set initial num_zones=20000 ic=uniform
-set physics rk_order=2 bc_lo=inflow bc_hi=inflow
+set initial num_zones=20000
+set initial ic=uniform
+set physics rk_order=2
+set physics bc_lo=inflow
+set physics bc_hi=inflow
+set physics inner_radius=1.0
+set physics outer_radius=2.0
+set physics v_inner=0.5
+set physics v_outer=0.5
 set output=binary
 repeat 0.01 t show message
 select products
