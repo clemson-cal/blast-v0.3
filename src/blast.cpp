@@ -33,7 +33,7 @@ SOFTWARE.
 #include "mist/core.hpp"
 #include "mist/driver.hpp"
 #include "mist/ndarray.hpp"
-#include "mist/parallel/pipeline.hpp"
+#include "mist/pipeline.hpp"
 #include "mist/serialize.hpp"
 
 using namespace mist;
@@ -463,7 +463,7 @@ struct cons_to_prim_t {
     }
 };
 
-struct global_dt_t {
+struct minimum_dt_t {
     static constexpr const char* name = "global_dt";
     using value_type = double;
 
@@ -590,6 +590,28 @@ struct compute_gradients_t {
     }
 };
 
+struct compute_edge_velocities_t {
+    static constexpr const char* name = "compute_edge_velocities";
+    auto value(patch_t p) const -> patch_t {
+        auto i0 = start(p.interior)[0];
+        auto i1 = upper(p.interior)[0] - 1;
+
+        // Inner edge velocity: average of gas velocities in adjacent zones
+        // Zone i0-1 is in guard region (from neighbor or BC), zone i0 is interior
+        auto v_l_inner = beta(p.prim[i0 - 1]);
+        auto v_r_inner = beta(p.prim[i0]);
+        p.grid.v_inner = 0.5 * (v_l_inner + v_r_inner);
+
+        // Outer edge velocity: average of gas velocities in adjacent zones
+        // Zone i1 is interior, zone i1+1 is in guard region (from neighbor or BC)
+        auto v_l_outer = beta(p.prim[i1]);
+        auto v_r_outer = beta(p.prim[i1 + 1]);
+        p.grid.v_outer = 0.5 * (v_l_outer + v_r_outer);
+
+        return p;
+    }
+};
+
 struct compute_fluxes_t {
     static constexpr const char* name = "compute_fluxes";
     auto value(patch_t p) const -> patch_t {
@@ -671,8 +693,6 @@ struct srhd {
         int rk_order = 1;
         double cfl = 0.4;
         double plm_theta = 1.5;
-        double v_inner = 0.0;  // inner boundary face velocity
-        double v_outer = 0.0;  // outer boundary face velocity
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
 
@@ -681,8 +701,6 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
-                field("v_inner", v_inner),
-                field("v_outer", v_outer),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -693,8 +711,6 @@ struct srhd {
                 field("rk_order", rk_order),
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
-                field("v_inner", v_inner),
-                field("v_outer", v_outer),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi)
             );
@@ -775,7 +791,7 @@ struct srhd {
 // =============================================================================
 
 auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5};
+    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow};
 }
 
 auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
@@ -787,14 +803,13 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
     using std::views::transform;
 
     auto& ini = ctx.initial;
-    auto& cfg = ctx.config;
     auto np = static_cast<int>(ini.num_partitions);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
     auto grid = grid_t{
         ini.inner_radius,
         ini.outer_radius,
-        cfg.v_inner,
-        cfg.v_outer,
+        0.0,  // v_inner computed dynamically from gas velocities
+        0.0,  // v_outer computed dynamically from gas velocities
         ini.num_zones
     };
 
@@ -813,15 +828,15 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
     auto grid = grid_t{
         ini.inner_radius,
         ini.outer_radius,
-        cfg.v_inner,
-        cfg.v_outer,
+        0.0,  // v_inner computed dynamically from gas velocities
+        0.0,  // v_outer computed dynamically from gas velocities
         ini.num_zones
     };
 
     auto new_step = parallel::pipeline(
         cons_to_prim_t{},
         local_dt_t{cfg.cfl, grid, cfg.plm_theta},
-        global_dt_t{},
+        minimum_dt_t{},
         cache_rk_t{}
     );
 
@@ -830,6 +845,7 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
         apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones},
         cons_to_prim_t{},
         compute_gradients_t{},
+        compute_edge_velocities_t{},
         compute_fluxes_t{},
         update_conserved_t{}
     );
