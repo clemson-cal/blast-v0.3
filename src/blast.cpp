@@ -325,35 +325,57 @@ static auto reldiff(double a, double b) -> double {
     return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
 }
 
-static auto is_contact(prim_t pL, prim_t pR, double tol_up, double tol_rho) -> bool {
-    return reldiff(pL[1], pR[1]) <= tol_up &&      // velocity match
-           reldiff(pL[2], pR[2]) <= tol_up &&      // pressure match
-           reldiff(pL[0], pR[0]) >= tol_rho;       // density jump
+// New spec: Step 1 - check density continuity
+static auto has_density_jump(prim_t pL, prim_t pR, double tol_rho) -> bool {
+    return reldiff(pL[0], pR[0]) >= tol_rho;
 }
 
-static auto is_shock(cons_t uL, cons_t uR, cons_t fL, cons_t fR,
-                     double& v_shock, double tol) -> bool {
-    auto dU = uR - uL;
-    auto dF = fR - fL;
+// New spec: Step 2 - check four-velocity continuity (given density is discontinuous)
+static auto has_velocity_jump(prim_t pL, prim_t pR, double tol_u) -> bool {
+    return reldiff(pL[1], pR[1]) > tol_u;
+}
 
-    // Avoid division by zero
-    if (std::fabs(dU[0]) < 1e-14 || std::fabs(dU[1]) < 1e-14 || std::fabs(dU[2]) < 1e-14)
-        return false;
+// Compute shock velocity using relativistic jump relations
+static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
+    constexpr double gamma_index = gamma_law;  // 4/3
 
-    double sD = dF[0] / dU[0];
-    double sS = dF[1] / dU[1];
-    double sE = dF[2] / dU[2];
+    // Determine upstream (unshocked) vs downstream (shocked) using pressure
+    double u_u, u_d, p_u, p_d;
+    double sign_shock;
 
-    double s_avg = (sD + sS + sE) / 3.0;
-
-    // Check if all speeds agree
-    if (reldiff(sD, s_avg) <= tol &&
-        reldiff(sS, s_avg) <= tol &&
-        reldiff(sE, s_avg) <= tol) {
-        v_shock = s_avg;
-        return true;
+    if (pL[2] > pR[2]) {
+        // Left is downstream (shocked), right is upstream (unshocked)
+        u_d = pL[1];
+        u_u = pR[1];
+        p_d = pL[2];
+        p_u = pR[2];
+        sign_shock = -1.0;  // shock propagates left to right
+    } else {
+        // Right is downstream (shocked), left is upstream (unshocked)
+        u_d = pR[1];
+        u_u = pL[1];
+        p_d = pR[2];
+        p_u = pL[2];
+        sign_shock = +1.0;  // shock propagates right to left
     }
-    return false;
+
+    // Relative Lorentz factor
+    double gamma_rel = std::sqrt(1.0 + u_u * u_u) * std::sqrt(1.0 + u_d * u_d) - u_u * u_d;
+
+    // Shock Lorentz factor (in upstream rest frame)
+    double gamma_shock = std::sqrt((gamma_rel + 1.0) * std::pow(gamma_index * (gamma_rel - 1.0) + 1.0, 2.0)
+                                   / (gamma_index * (2.0 - gamma_index) * (gamma_rel - 1.0) + 2.0));
+
+    // Shock velocity in upstream rest frame
+    double beta_shock = sign_shock * std::sqrt(1.0 - 1.0 / (gamma_shock * gamma_shock));
+
+    // Upstream velocity in lab frame
+    double beta_u = u_u / std::sqrt(1.0 + u_u * u_u);
+
+    // Boost shock velocity to lab frame using relativistic velocity addition
+    double v_edge = (beta_u + beta_shock) / (1.0 + beta_u * beta_shock);
+
+    return v_edge;
 }
 
 // =============================================================================
@@ -921,9 +943,8 @@ struct compute_gradients_t {
 
 struct classify_element_boundaries_t {
     static constexpr const char* name = "classify_boundaries";
-    double tol_contact_up;
-    double tol_contact_rho;
-    double tol_shock;
+    double tol_rho;  // tolerance for density continuity check
+    double tol_u;    // tolerance for four-velocity continuity check
 
     auto value(patch_t p) const -> patch_t {
         for (unsigned k = 0; k <= p.Ne; ++k) {
@@ -939,26 +960,30 @@ struct classify_element_boundaries_t {
 
             double v = 0.0;
 
-            // Check contact condition
-            if (is_contact(pL, pR, tol_contact_up, tol_contact_rho)) {
-                p.edge_type[k] = 1;
-                v = beta(pL);  // contact moves with fluid
+            // New spec classification algorithm:
+            // Step 1: Check if density is discontinuous
+            if (!has_density_jump(pL, pR, tol_rho)) {
+                // Density is continuous → neither shock nor contact
+                p.edge_type[k] = 0;
+                v = 0.5 * (beta(pL) + beta(pR));
             }
-            // Check shock condition
-            else if (is_shock(uL, uR, fL, fR, v, tol_shock)) {
+            // Step 2: Check if four-velocity is discontinuous (given density is discontinuous)
+            else if (has_velocity_jump(pL, pR, tol_u)) {
+                // Four-velocity is discontinuous → shock
                 p.edge_type[k] = 2;
-                // v set by is_shock
+                v = compute_shock_velocity(pL, pR);
             }
             else {
-                p.edge_type[k] = 0;
-                v = 0.5 * (beta(pL) + beta(pR));  // average of adjacent fluid velocities
+                // Four-velocity is continuous → contact
+                p.edge_type[k] = 1;
+                v = 0.5 * (beta(pL) + beta(pR));
             }
 
             p.v_edge[k] = v;
 
-            // R-H flux for contact/shock; stored for "neither" too but won't be used
-            // fhat = FL - UL * v (or equivalently FR - UR * v)
-            p.fhat_edge[k] = (fL + fR) * 0.5 - (uL + uR) * (0.5 * v);
+            // Compute flux at discontinuity using F - v*U
+            // Use interior-biased gradient (no PLM reconstruction at boundary)
+            p.fhat_edge[k] = fL - uL * v;
         }
         return p;
     }
@@ -1108,9 +1133,8 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
-        double tol_contact_up = 1e-3;      // velocity/pressure matching tolerance for contact
-        double tol_contact_rho = 0.1;      // minimum density jump for contact
-        double tol_shock = 1e-2;           // shock speed agreement tolerance
+        double tol_rho = 0.1;   // density discontinuity tolerance
+        double tol_u = 1e-3;    // four-velocity discontinuity tolerance
 
         auto fields() const {
             return std::make_tuple(
@@ -1120,9 +1144,8 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("tol_contact_up", tol_contact_up),
-                field("tol_contact_rho", tol_contact_rho),
-                field("tol_shock", tol_shock)
+                field("tol_rho", tol_rho),
+                field("tol_u", tol_u)
             );
         }
 
@@ -1134,9 +1157,8 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("tol_contact_up", tol_contact_up),
-                field("tol_contact_rho", tol_contact_rho),
-                field("tol_shock", tol_shock)
+                field("tol_rho", tol_rho),
+                field("tol_u", tol_u)
             );
         }
     };
@@ -1221,7 +1243,7 @@ struct blast {
 // =============================================================================
 
 auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .tol_contact_up = 1e-3, .tol_contact_rho = 0.1, .tol_shock = 1e-2};
+    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .tol_rho = 0.1, .tol_u = 1e-3};
 }
 
 auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
@@ -1278,7 +1300,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones, ini.tstart},
         cons_to_prim_t{},
         compute_gradients_t{},
-        classify_element_boundaries_t{cfg.tol_contact_up, cfg.tol_contact_rho, cfg.tol_shock},
+        classify_element_boundaries_t{cfg.tol_rho, cfg.tol_u},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );
