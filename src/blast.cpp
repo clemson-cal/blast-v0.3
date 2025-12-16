@@ -31,7 +31,9 @@ SOFTWARE.
 #include <numeric>
 #include <ranges>
 #include "mist/core.hpp"
-#include "mist/driver.hpp"
+#include "mist/driver/physics_impl.hpp"
+#include "mist/driver/repl_session.hpp"
+#include "mist/driver/socket_session.hpp"
 #include "mist/ndarray.hpp"
 #include "mist/pipeline.hpp"
 #include "mist/serialize.hpp"
@@ -646,6 +648,7 @@ struct cons_to_prim_t {
 };
 
 struct minimum_dt_t {
+    double dt_max;
     static constexpr const char* name = "global_dt";
     using value_type = double;
 
@@ -658,7 +661,7 @@ struct minimum_dt_t {
     }
 
     void finalize(double dt, patch_t& p) const {
-        p.dt = dt;
+        p.dt = std::min(dt, dt_max);
     }
 };
 
@@ -890,7 +893,7 @@ auto deserialize(A& ar, patch_t& p) -> bool {
 // 1D Special Relativistic Hydrodynamics Physics Module
 // =============================================================================
 
-struct srhd {
+struct blast {
 
     struct config_t {
         int rk_order = 1;
@@ -1002,15 +1005,15 @@ struct srhd {
 // Physics interface implementation
 // =============================================================================
 
-auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
+auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
     return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc};
 }
 
-auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
+auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
     return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .tstart = 0.0, .ic = initial_condition::uniform, .geom = geometry::spherical};
 }
 
-auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
+auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
     using std::views::iota;
     using std::views::transform;
 
@@ -1035,7 +1038,7 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
     return {std::move(patches), 0.0};
 }
 
-void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
+void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_max) {
     auto& ini = ctx.initial;
     auto& cfg = ctx.config;
     auto grid = grid_t{
@@ -1050,7 +1053,7 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
     auto new_step = parallel::pipeline(
         cons_to_prim_t{},
         local_dt_t{cfg.cfl, grid, cfg.plm_theta},
-        minimum_dt_t{},
+        minimum_dt_t{dt_max},
         cache_rk_t{}
     );
 
@@ -1089,23 +1092,23 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
     state.time = state.patches[0].time;
 }
 
-auto zone_count(const srhd::state_t& state, const srhd::exec_context_t& ctx) -> std::size_t {
+auto zone_count(const blast::state_t& state, const blast::exec_context_t& ctx) -> std::size_t {
     return ctx.initial.num_zones;
 }
 
-auto names_of_time(std::type_identity<srhd>) -> std::vector<std::string> {
+auto names_of_time(std::type_identity<blast>) -> std::vector<std::string> {
     return {"t"};
 }
 
-auto names_of_timeseries(std::type_identity<srhd>) -> std::vector<std::string> {
+auto names_of_timeseries(std::type_identity<blast>) -> std::vector<std::string> {
     return {"time", "total_mass", "total_energy", "max_lorentz"};
 }
 
-auto names_of_products(std::type_identity<srhd>) -> std::vector<std::string> {
+auto names_of_products(std::type_identity<blast>) -> std::vector<std::string> {
     return {"density", "velocity", "pressure", "lorentz_factor", "cell_r"};
 }
 
-auto get_time(const srhd::state_t& state, const std::string& name) -> double {
+auto get_time(const blast::state_t& state, const std::string& name) -> double {
     if (name == "t") {
         return state.time;
     }
@@ -1113,9 +1116,9 @@ auto get_time(const srhd::state_t& state, const std::string& name) -> double {
 }
 
 auto get_timeseries(
-    const srhd::config_t& cfg,
-    const srhd::initial_t& ini,
-    const srhd::state_t& state,
+    const blast::config_t& cfg,
+    const blast::initial_t& ini,
+    const blast::state_t& state,
     const std::string& name
 ) -> double {
     if (name == "time") {
@@ -1148,10 +1151,10 @@ auto get_timeseries(
 }
 
 auto get_product(
-    const srhd::state_t& state,
+    const blast::state_t& state,
     const std::string& name,
-    const srhd::exec_context_t& ctx
-) -> srhd::product_t {
+    const blast::exec_context_t& ctx
+) -> blast::product_t {
     using std::views::transform;
 
     // Ensure prim is up-to-date
@@ -1189,7 +1192,7 @@ auto get_product(
     throw std::runtime_error("unknown product: " + name);
 }
 
-auto get_profiler_data(const srhd::exec_context_t& ctx)
+auto get_profiler_data(const blast::exec_context_t& ctx)
     -> std::map<std::string, perf::profile_entry_t>
 {
     return ctx.profiler.data();
@@ -1199,9 +1202,25 @@ auto get_profiler_data(const srhd::exec_context_t& ctx)
 // Main
 // =============================================================================
 
-int main()
+int main(int argc, const char* argv[])
 {
-    mist::program_t<srhd> prog;
-    mist::run(prog);
+    auto use_socket = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--socket") == 0 || std::strcmp(argv[i], "-s") == 0) {
+            use_socket = true;
+        }
+    }
+
+    auto physics = mist::driver::make_physics<blast>();
+    auto state = mist::driver::state_t{};
+    auto engine = mist::driver::engine_t{state, *physics};
+
+    if (use_socket) {
+        auto session = mist::driver::socket_session_t{engine};
+        session.run();
+    } else {
+        auto session = mist::driver::repl_session_t{engine};
+        session.run();
+    }
     return 0;
 }
