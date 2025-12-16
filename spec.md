@@ -71,15 +71,35 @@ All checks use tolerance parameters for numerical robustness.
 
 **Shock (edge_type = 2):**
 ```cpp
+// Determine upstream (unshocked) vs downstream (shocked) using pressure
+double u_u, u_d, p_u, p_d;
+double sign_shock;
+if (PL[2] > PR[2]) {
+    // Left is downstream (shocked), right is upstream (unshocked)
+    u_d = PL[1];  // four-velocity from primitive (gamma*beta)
+    u_u = PR[1];
+    p_d = PL[2];
+    p_u = PR[2];
+    sign_shock = -1.0;  // shock propagates from left to right (negative direction)
+} else {
+    // Right is downstream (shocked), left is upstream (unshocked)
+    u_d = PR[1];
+    u_u = PL[1];
+    p_d = PR[2];
+    p_u = PL[2];
+    sign_shock = +1.0;  // shock propagates from right to left (positive direction)
+}
+
 gamma_rel = sqrt(1.0 + u_u * u_u) * sqrt(1.0 + u_d * u_d) - u_u * u_d;
 gamma_index = 4.0 / 3.0;
 gamma_shock = sqrt((gamma_rel + 1.0) * pow(gamma_index * (gamma_rel - 1.0) + 1.0, 2)
                    / (gamma_index * (2.0 - gamma_index) * (gamma_rel - 1.0) + 2.0));
-beta_shock = -sqrt(1.0 - 1.0 / (gamma_shock * gamma_shock));
-beta_d = u_d / sqrt(1.0 + u_d * u_d);
-v_edge[k] = (beta_d + beta_shock) / (1.0 + beta_d * beta_shock);
+beta_shock = sign_shock * sqrt(1.0 - 1.0 / (gamma_shock * gamma_shock));
+beta_u = u_u / sqrt(1.0 + u_u * u_u);
+v_edge[k] = (beta_u + beta_shock) / (1.0 + beta_u * beta_shock);
 ```
-where `u_u` is upstream four-velocity and `u_d` is downstream four-velocity.
+The shock velocity `beta_shock` is in the upstream rest frame and is boosted to the lab frame using `beta_u`.
+Upstream (unshocked) vs downstream (shocked) regions are determined by comparing pressures.
 
 **Contact (edge_type = 1):**
 ```cpp
