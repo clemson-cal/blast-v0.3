@@ -428,7 +428,8 @@ enum class initial_condition {
     blast_wave,
     wind,
     uniform,
-    four_state
+    four_state,
+    mignone_bodo,
 };
 
 auto to_string(initial_condition ic) -> const char* {
@@ -438,6 +439,7 @@ auto to_string(initial_condition ic) -> const char* {
         case initial_condition::wind: return "wind";
         case initial_condition::uniform: return "uniform";
         case initial_condition::four_state: return "four_state";
+        case initial_condition::mignone_bodo: return "mignone_bodo";
     }
     return "unknown";
 }
@@ -448,6 +450,7 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     if (s == "wind") return initial_condition::wind;
     if (s == "uniform") return initial_condition::uniform;
     if (s == "four_state") return initial_condition::four_state;
+    if (s == "mignone_bodo") return initial_condition::mignone_bodo;
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
@@ -509,6 +512,12 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
                 return prim_t{dr, ur, p_cold * dr};
             }
         }
+        case initial_condition::mignone_bodo:
+            if (r < 5.0) {
+                return prim_t{1.0, 2.065, 1.0};
+            } else {
+                return prim_t{1.0, 0.0, 10.0};
+            }
     }
     assert(false);
 }

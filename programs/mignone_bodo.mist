@@ -1,0 +1,10 @@
+set initial num_zones=100 inner_radius=0.0 outer_radius=1.0 ic=mignone_bodo geom=planar
+set physics rk_order=1 cfl=0.8 bc_lo=outflow bc_hi=outflow plm_theta=0.0
+set output=ascii
+repeat 0.01 t show message
+init
+t -> 0.4
+show all
+select products
+write products
+stop
