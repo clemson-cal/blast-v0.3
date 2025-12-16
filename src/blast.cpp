@@ -318,6 +318,45 @@ static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> c
 }
 
 // =============================================================================
+// Discontinuity detection helpers
+// =============================================================================
+
+static auto reldiff(double a, double b) -> double {
+    return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
+}
+
+static auto is_contact(prim_t pL, prim_t pR, double tol_up, double tol_rho) -> bool {
+    return reldiff(pL[1], pR[1]) <= tol_up &&      // velocity match
+           reldiff(pL[2], pR[2]) <= tol_up &&      // pressure match
+           reldiff(pL[0], pR[0]) >= tol_rho;       // density jump
+}
+
+static auto is_shock(cons_t uL, cons_t uR, cons_t fL, cons_t fR,
+                     double& v_shock, double tol) -> bool {
+    auto dU = uR - uL;
+    auto dF = fR - fL;
+
+    // Avoid division by zero
+    if (std::fabs(dU[0]) < 1e-14 || std::fabs(dU[1]) < 1e-14 || std::fabs(dU[2]) < 1e-14)
+        return false;
+
+    double sD = dF[0] / dU[0];
+    double sS = dF[1] / dU[1];
+    double sE = dF[2] / dU[2];
+
+    double s_avg = (sD + sS + sE) / 3.0;
+
+    // Check if all speeds agree
+    if (reldiff(sD, s_avg) <= tol &&
+        reldiff(sS, s_avg) <= tol &&
+        reldiff(sE, s_avg) <= tol) {
+        v_shock = s_avg;
+        return true;
+    }
+    return false;
+}
+
+// =============================================================================
 // Riemann solver types
 // =============================================================================
 
@@ -456,6 +495,16 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
+static auto num_elements_for_ic(initial_condition ic) -> unsigned {
+    switch (ic) {
+        case initial_condition::wind:
+        case initial_condition::blast_wave:
+            return 2;
+        default:
+            return 1;
+    }
+}
+
 static auto initial_primitive(initial_condition ic, double r, double tstart = 0.0) -> prim_t {
     switch (ic) {
         case initial_condition::sod:
@@ -563,6 +612,14 @@ struct patch_t {
     double time_rk = 0.0;
     double plm_theta = 1.5;
 
+    // Element structure for moving subdomain boundaries
+    unsigned Ne = 1;                      // number of elements
+    unsigned Nz = 0;                      // zones per element
+    std::vector<double> edges;            // size Ne+1, element boundary positions
+    std::vector<double> v_edge;           // size Ne+1, element boundary velocities
+    std::vector<int> edge_type;           // size Ne+1, 0=neither, 1=contact, 2=shock
+    std::vector<cons_t> fhat_edge;        // size Ne+1, flux density at element boundaries
+
     cached_t<cons_t, 1> cons;
     cached_t<cons_t, 1> cons_rk;  // RK cached state
     mutable cached_t<prim_t, 1> prim;  // primitive variables at cell centers
@@ -580,6 +637,63 @@ struct patch_t {
         , fhat(cache(fill(index_space(start(s), shape(s) + uvec(1)), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
     {
     }
+
+    // Element-aware geometry methods (handles guard cells via extrapolation)
+    auto face_radius(int f) const -> double {
+        // f is global face index; interior range is [0, num_zones]
+        // For guard cells (f < 0 or f > num_zones), extrapolate linearly
+        if (f < 0) {
+            // Extrapolate below domain using first element's spacing
+            double dr0 = (edges[1] - edges[0]) / Nz;
+            return edges[0] + f * dr0;
+        } else if (f > static_cast<int>(grid.num_zones)) {
+            // Extrapolate above domain using last element's spacing
+            double drN = (edges[Ne] - edges[Ne - 1]) / Nz;
+            return edges[Ne] + (f - static_cast<int>(grid.num_zones)) * drN;
+        } else if (f == static_cast<int>(grid.num_zones)) {
+            return edges[Ne];
+        } else {
+            int e = f / Nz;
+            int j = f % Nz;
+            return edges[e] + (double(j) / Nz) * (edges[e + 1] - edges[e]);
+        }
+    }
+
+    auto face_velocity(int f) const -> double {
+        // Clamp to valid element range for velocity interpolation
+        if (f < 0) {
+            return v_edge[0];  // Use inner boundary velocity
+        } else if (f >= static_cast<int>(grid.num_zones)) {
+            return v_edge[Ne];  // Use outer boundary velocity
+        } else {
+            int e = f / Nz;
+            double alpha = double(f % Nz) / Nz;
+            return (1.0 - alpha) * v_edge[e] + alpha * v_edge[e + 1];
+        }
+    }
+
+    auto face_area(int f) const -> double {
+        if (grid.geom == geometry::planar) {
+            return 1.0;
+        } else {
+            auto r = face_radius(f);
+            return four_pi * r * r;
+        }
+    }
+
+    auto cell_volume(int i) const -> double {
+        if (grid.geom == geometry::planar) {
+            return face_radius(i + 1) - face_radius(i);
+        } else {
+            auto rl = face_radius(i);
+            auto rr = face_radius(i + 1);
+            return four_pi / 3.0 * (rr * rr * rr - rl * rl * rl);
+        }
+    }
+
+    auto cell_radius(int i) const -> double {
+        return 0.5 * (face_radius(i) + face_radius(i + 1));
+    }
 };
 
 // =============================================================================
@@ -591,13 +705,31 @@ struct initial_state_t {
     grid_t grid;
     initial_condition ic;
     double tstart;
+    unsigned num_elements;
 
     auto value(patch_t p) const -> patch_t {
         p.grid = grid;
+
+        // Initialize element structure
+        p.Ne = num_elements;
+        p.Nz = grid.num_zones / num_elements;
+        p.edges.resize(p.Ne + 1);
+        p.v_edge.resize(p.Ne + 1, 0.0);
+        p.edge_type.resize(p.Ne + 1, 0);
+        p.fhat_edge.resize(p.Ne + 1, cons_t{});
+
+        // Initialize edges uniformly across domain
+        double r0 = grid.r0_initial;
+        double r1 = grid.r1_initial;
+        for (unsigned k = 0; k <= p.Ne; ++k) {
+            p.edges[k] = r0 + k * (r1 - r0) / p.Ne;
+        }
+
+        // Initialize conserved variables
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rc = grid.cell_radius(i, 0.0);
-            auto dv = grid.cell_volume(i, 0.0);
+            auto rc = p.cell_radius(i);
+            auto dv = p.cell_volume(i);
             auto prim = initial_primitive(ic, rc, tstart);
             auto cons = prim_to_cons(prim);
             p.cons[i] = cons * dv;
@@ -619,9 +751,20 @@ struct local_dt_t {
         auto wavespeeds = lazy(p.interior, [&p](ivec_t<1> i) {
             return max_wavespeed(p.prim(i));
         });
-        // Account for mesh motion: max face velocity magnitude
-        auto max_vface = max2(std::fabs(grid.v_inner), std::fabs(grid.v_outer));
-        p.dt = cfl * grid.dr(p.time) / (max(wavespeeds) + max_vface);
+
+        // Compute effective dr from minimum element width
+        double dr_eff = std::numeric_limits<double>::max();
+        for (unsigned k = 0; k < p.Ne; ++k) {
+            dr_eff = min2(dr_eff, (p.edges[k + 1] - p.edges[k]) / p.Nz);
+        }
+
+        // Account for mesh motion: max edge velocity magnitude
+        double max_vface = 0.0;
+        for (unsigned k = 0; k <= p.Ne; ++k) {
+            max_vface = max2(max_vface, std::fabs(p.v_edge[k]));
+        }
+
+        p.dt = cfl * dr_eff / (max(wavespeeds) + max_vface);
         return p;
     }
 };
@@ -640,7 +783,7 @@ struct cons_to_prim_t {
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.prim), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto dv = p.grid.cell_volume(i, p.time);
+            auto dv = p.cell_volume(i);
             p.prim[i] = cons_to_prim(p.cons[i] / dv);
         });
         return p;
@@ -776,24 +919,47 @@ struct compute_gradients_t {
     }
 };
 
-struct compute_edge_velocities_t {
-    static constexpr const char* name = "compute_edge_velocities";
+struct classify_element_boundaries_t {
+    static constexpr const char* name = "classify_boundaries";
+    double tol_contact_up;
+    double tol_contact_rho;
+    double tol_shock;
+
     auto value(patch_t p) const -> patch_t {
-        auto i0 = start(p.interior)[0];
-        auto i1 = upper(p.interior)[0] - 1;
+        for (unsigned k = 0; k <= p.Ne; ++k) {
+            int f = k * p.Nz;  // global face index at element boundary
 
-        // Inner edge velocity: average of gas velocities in adjacent zones
-        // Zone i0-1 is in guard region (from neighbor or BC), zone i0 is interior
-        auto v_l_inner = beta(p.prim[i0 - 1]);
-        auto v_r_inner = beta(p.prim[i0]);
-        p.grid.v_inner = 0.0; //0.5 * (v_l_inner + v_r_inner);
+            // Get L/R states at boundary (using guard cells for domain boundaries)
+            auto pL = p.prim[f - 1];
+            auto pR = p.prim[f];
+            auto uL = prim_to_cons(pL);
+            auto uR = prim_to_cons(pR);
+            auto fL = prim_and_cons_to_flux(pL, uL);
+            auto fR = prim_and_cons_to_flux(pR, uR);
 
-        // Outer edge velocity: average of gas velocities in adjacent zones
-        // Zone i1 is interior, zone i1+1 is in guard region (from neighbor or BC)
-        auto v_l_outer = beta(p.prim[i1]);
-        auto v_r_outer = beta(p.prim[i1 + 1]);
-        p.grid.v_outer = 0.0; //0.5 * (v_l_outer + v_r_outer);
+            double v = 0.0;
 
+            // Check contact condition
+            if (is_contact(pL, pR, tol_contact_up, tol_contact_rho)) {
+                p.edge_type[k] = 1;
+                v = beta(pL);  // contact moves with fluid
+            }
+            // Check shock condition
+            else if (is_shock(uL, uR, fL, fR, v, tol_shock)) {
+                p.edge_type[k] = 2;
+                // v set by is_shock
+            }
+            else {
+                p.edge_type[k] = 0;
+                v = 0.5 * (beta(pL) + beta(pR));  // average of adjacent fluid velocities
+            }
+
+            p.v_edge[k] = v;
+
+            // R-H flux for contact/shock; stored for "neither" too but won't be used
+            // fhat = FL - UL * v (or equivalently FR - UR * v)
+            p.fhat_edge[k] = (fL + fR) * 0.5 - (uL + uR) * (0.5 * v);
+        }
         return p;
     }
 };
@@ -804,25 +970,38 @@ struct compute_fluxes_t {
 
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.fhat), [&](ivec_t<1> idx) {
-            auto i = idx[0];
-            auto da = p.grid.face_area(i, p.time);
-            auto vf = p.grid.face_velocity(i);
-            auto pl = p.prim[i - 1] + p.grad[i - 1] * 0.5;
-            auto pr = p.prim[i + 0] - p.grad[i + 0] * 0.5;
-            auto ul = prim_to_cons(pl);
-            auto ur = prim_to_cons(pr);
+            int f = idx[0];
+            unsigned k = f / p.Nz;  // element boundary index
 
-            switch (solver) {
-                case riemann_solver::hlle:
-                    p.fhat[i] = riemann_hlle(pl, pr, ul, ur, vf) * da;
-                    break;
-                case riemann_solver::hllc:
-                    p.fhat[i] = riemann_hllc(pl, pr, ul, ur, vf) * da;
-                    break;
-                case riemann_solver::two_shock:
-                    throw std::runtime_error("two_shock riemann solver not implemented for flux calculation");
-                case riemann_solver::exact:
-                    throw std::runtime_error("exact riemann solver not implemented");
+            // Check if this face is an element boundary with contact/shock treatment
+            bool is_element_boundary = (f % static_cast<int>(p.Nz) == 0);
+            bool has_special_flux = is_element_boundary && k <= p.Ne && p.edge_type[k] != 0;
+
+            if (has_special_flux) {
+                // Use pre-computed R-H flux at element boundary
+                auto da = p.face_area(f);
+                p.fhat[f] = p.fhat_edge[k] * da;
+            } else {
+                // Normal Riemann solve with PLM reconstruction
+                auto da = p.face_area(f);
+                auto vf = p.face_velocity(f);
+                auto pl = p.prim[f - 1] + p.grad[f - 1] * 0.5;
+                auto pr = p.prim[f + 0] - p.grad[f + 0] * 0.5;
+                auto ul = prim_to_cons(pl);
+                auto ur = prim_to_cons(pr);
+
+                switch (solver) {
+                    case riemann_solver::hlle:
+                        p.fhat[f] = riemann_hlle(pl, pr, ul, ur, vf) * da;
+                        break;
+                    case riemann_solver::hllc:
+                        p.fhat[f] = riemann_hllc(pl, pr, ul, ur, vf) * da;
+                        break;
+                    case riemann_solver::two_shock:
+                        throw std::runtime_error("two_shock riemann solver not implemented for flux calculation");
+                    case riemann_solver::exact:
+                        throw std::runtime_error("exact riemann solver not implemented");
+                }
             }
         });
         return p;
@@ -833,7 +1012,6 @@ struct update_conserved_t {
     static constexpr const char* name = "update_conserved";
     auto value(patch_t p) const -> patch_t {
         auto dt = p.dt;
-        auto t = p.time;
 
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
@@ -841,12 +1019,26 @@ struct update_conserved_t {
 
             // Apply geometric source terms only for spherical geometry
             if (p.grid.geom == geometry::spherical) {
-                auto rl = p.grid.face_radius(i, t);
-                auto rr = p.grid.face_radius(i + 1, t);
+                auto rl = p.face_radius(i);
+                auto rr = p.face_radius(i + 1);
                 auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
                 p.cons[i] += source * dt;
             }
         });
+
+        // Move element boundaries
+        for (unsigned k = 0; k <= p.Ne; ++k) {
+            p.edges[k] += dt * p.v_edge[k];
+        }
+
+        // Enforce monotonicity
+        constexpr double min_width = 1e-12;
+        for (unsigned k = 0; k < p.Ne; ++k) {
+            if (p.edges[k + 1] <= p.edges[k] + min_width) {
+                p.edges[k + 1] = p.edges[k] + min_width;
+            }
+        }
+
         p.time += p.dt;
         return p;
     }
@@ -875,6 +1067,9 @@ void serialize(A& ar, const patch_t& p) {
     ar.begin_group();
     auto interior = cache(map(p.cons[p.interior], std::identity{}), memory::host, exec::cpu);
     serialize(ar, "cons", interior);
+    serialize(ar, "Ne", p.Ne);
+    serialize(ar, "Nz", p.Nz);
+    serialize(ar, "edges", p.edges);
     ar.end_group();
 }
 
@@ -883,9 +1078,20 @@ auto deserialize(A& ar, patch_t& p) -> bool {
     if (!ar.begin_group()) return false;
     auto interior = cached_t<cons_t, 1>{};
     deserialize(ar, "cons", interior);
+    unsigned Ne = 1, Nz = 0;
+    std::vector<double> edges;
+    deserialize(ar, "Ne", Ne);
+    deserialize(ar, "Nz", Nz);
+    deserialize(ar, "edges", edges);
     ar.end_group();
     p = patch_t(space(interior));
     copy(p.cons[p.interior], interior);
+    p.Ne = Ne;
+    p.Nz = Nz;
+    p.edges = std::move(edges);
+    p.v_edge.resize(p.Ne + 1, 0.0);
+    p.edge_type.resize(p.Ne + 1, 0);
+    p.fhat_edge.resize(p.Ne + 1, cons_t{});
     return true;
 }
 
@@ -902,6 +1108,9 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
+        double tol_contact_up = 1e-3;      // velocity/pressure matching tolerance for contact
+        double tol_contact_rho = 0.1;      // minimum density jump for contact
+        double tol_shock = 1e-2;           // shock speed agreement tolerance
 
         auto fields() const {
             return std::make_tuple(
@@ -910,7 +1119,10 @@ struct blast {
                 field("plm_theta", plm_theta),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
-                field("riemann", riemann)
+                field("riemann", riemann),
+                field("tol_contact_up", tol_contact_up),
+                field("tol_contact_rho", tol_contact_rho),
+                field("tol_shock", tol_shock)
             );
         }
 
@@ -921,7 +1133,10 @@ struct blast {
                 field("plm_theta", plm_theta),
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
-                field("riemann", riemann)
+                field("riemann", riemann),
+                field("tol_contact_up", tol_contact_up),
+                field("tol_contact_rho", tol_contact_rho),
+                field("tol_shock", tol_shock)
             );
         }
     };
@@ -1006,7 +1221,7 @@ struct blast {
 // =============================================================================
 
 auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc};
+    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .tol_contact_up = 1e-3, .tol_contact_rho = 0.1, .tol_shock = 1e-2};
 }
 
 auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
@@ -1020,11 +1235,12 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
     auto& ini = ctx.initial;
     auto np = static_cast<int>(ini.num_partitions);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
+    auto num_elements = num_elements_for_ic(ini.ic);
     auto grid = grid_t{
         ini.inner_radius,
         ini.outer_radius,
-        0.0,  // v_inner computed dynamically from gas velocities
-        0.0,  // v_outer computed dynamically from gas velocities
+        0.0,  // v_inner computed dynamically
+        0.0,  // v_outer computed dynamically
         ini.num_zones,
         ini.geom
     };
@@ -1033,7 +1249,7 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
         return patch_t(subspace(S, np, p, 0));
     }));
 
-    ctx.execute(patches, initial_state_t{grid, ini.ic, ini.tstart});
+    ctx.execute(patches, initial_state_t{grid, ini.ic, ini.tstart, num_elements});
 
     return {std::move(patches), 0.0};
 }
@@ -1062,7 +1278,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones, ini.tstart},
         cons_to_prim_t{},
         compute_gradients_t{},
-        compute_edge_velocities_t{},
+        classify_element_boundaries_t{cfg.tol_contact_up, cfg.tol_contact_rho, cfg.tol_shock},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );
