@@ -225,6 +225,81 @@ static auto riemann_hlle(prim_t pl, prim_t pr, cons_t ul, cons_t ur, double v_fa
     return f_hll - u_hll * v_face;
 }
 
+static auto riemann_hllc(prim_t pl, prim_t pr, cons_t ul, cons_t ur, double v_face = 0.0) -> cons_t {
+    auto fl = prim_and_cons_to_flux(pl, ul);
+    auto fr = prim_and_cons_to_flux(pr, ur);
+
+    auto ws_l = outer_wavespeeds(pl);
+    auto ws_r = outer_wavespeeds(pr);
+    auto alm = ws_l[0];
+    auto alp = ws_l[1];
+    auto arm = ws_r[0];
+    auto arp = ws_r[1];
+    auto ar = max2(alp, arp);
+    auto al = min2(alm, arm);
+
+    // Equations (9) and (11) from Mignone & Bodo 2005
+    auto u_hll = (ur * ar - ul * al + (fl - fr))           / (ar - al);
+    auto f_hll = (fl * ar - fr * al - (ul - ur) * ar * al) / (ar - al);
+
+    auto discriminant = [](double a, double b, double c) -> double {
+        return b * b - 4.0 * a * c;
+    };
+
+    auto quadratic_root = [&discriminant](double a, double b, double c) -> double {
+        auto d = discriminant(a, b, c);
+        if (d < 0.0) {
+            return 0.0;
+        } else if (std::fabs(a) < 1e-8) {
+            return -c / b;
+        } else {
+            return (-b - std::sqrt(d)) / 2.0 / a;
+        }
+    };
+
+    // Equation (18) for a-star and p-star
+    auto a_star_and_p_star = [&]() -> std::pair<double, double> {
+        // Mignone defines total energy to include rest mass
+        auto ue_hll = u_hll[2] + u_hll[0];
+        auto fe_hll = f_hll[2] + f_hll[0];
+        auto um_hll = u_hll[1];
+        auto fm_hll = f_hll[1];
+        auto a_star = quadratic_root(fe_hll, -fm_hll - ue_hll, um_hll);
+        auto p_star = -fe_hll * a_star + fm_hll;
+        if (std::isnan(a_star)) {
+            std::cerr << "a* is NaN, pl = [" << pl[0] << ", " << pl[1] << ", " << pl[2]
+                      << "], pr = [" << pr[0] << ", " << pr[1] << ", " << pr[2] << "]\n";
+        }
+        return {a_star, p_star};
+    };
+
+    // Equations (16)
+    auto star_state_flux = [](cons_t u, cons_t f, prim_t p, double a, double vface, double a_star, double p_star) -> cons_t {
+        auto e = u[2] + u[0];
+        auto m = u[1];
+        auto v = beta(p);
+        auto es = (e * (a - v) + p_star * a_star - p[2] * v) / (a - a_star);
+        auto ms = (m * (a - v) + p_star          - p[2])     / (a - a_star);
+        auto ds = u[0] * (a - v)                             / (a - a_star);
+        auto us = cons_t{ds, ms, es - ds};
+        auto fs = f + (us - u) * a;
+        return fs - us * vface;
+    };
+
+    if (v_face <= al) {
+        return fl - ul * v_face;
+    } else if (v_face >= ar) {
+        return fr - ur * v_face;
+    } else {
+        auto [a_star, p_star] = a_star_and_p_star();
+        if (v_face <= a_star) {
+            return star_state_flux(ul, fl, pl, al, v_face, a_star, p_star);
+        } else {
+            return star_state_flux(ur, fr, pr, ar, v_face, a_star, p_star);
+        }
+    }
+}
+
 static auto max_wavespeed(prim_t p) -> double {
     auto ws = outer_wavespeeds(p);
     return max2(std::fabs(ws[0]), std::fabs(ws[1]));
@@ -241,8 +316,27 @@ static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> c
 }
 
 // =============================================================================
-// Spherical geometry
+// Geometry
 // =============================================================================
+
+enum class geometry {
+    planar,
+    spherical
+};
+
+auto to_string(geometry g) -> const char* {
+    switch (g) {
+        case geometry::planar: return "planar";
+        case geometry::spherical: return "spherical";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<geometry>, const std::string& s) -> geometry {
+    if (s == "planar") return geometry::planar;
+    if (s == "spherical") return geometry::spherical;
+    throw std::runtime_error("unknown geometry: " + s);
+}
 
 struct grid_t {
     double r0_initial = 0.0;  // inner radius at t=0
@@ -250,6 +344,7 @@ struct grid_t {
     double v_inner = 0.0;     // inner boundary velocity
     double v_outer = 0.0;     // outer boundary velocity
     unsigned num_zones = 0;
+    geometry geom = geometry::spherical;
 
     auto inner_radius(double t) const -> double {
         return r0_initial + v_inner * t;
@@ -276,14 +371,22 @@ struct grid_t {
     }
 
     auto face_area(int i, double t) const -> double {
-        auto r = face_radius(i, t);
-        return four_pi * r * r;
+        if (geom == geometry::planar) {
+            return 1.0;
+        } else {
+            auto r = face_radius(i, t);
+            return four_pi * r * r;
+        }
     }
 
     auto cell_volume(int i, double t) const -> double {
-        auto rl = face_radius(i, t);
-        auto rr = face_radius(i + 1, t);
-        return four_pi / 3.0 * (rr * rr * rr - rl * rl * rl);
+        if (geom == geometry::planar) {
+            return dr(t);  // Volume is just dx for planar
+        } else {
+            auto rl = face_radius(i, t);
+            auto rr = face_radius(i + 1, t);
+            return four_pi / 3.0 * (rr * rr * rr - rl * rl * rl);
+        }
     }
 };
 
@@ -343,10 +446,10 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
             return prim_t{1.0, 0.0, 1.0};
         case initial_condition::four_state: {
             // Converging cold flow: left moves right, right moves left
-            constexpr double dl = 1.0;
-            constexpr double ul = 1.0;   // four-velocity, moving right
+            constexpr double dl = 10.0;
+            constexpr double ul = 10.0;   // four-velocity, moving right
             constexpr double dr = 1.0;
-            constexpr double ur = -1.0;  // four-velocity, moving left
+            constexpr double ur = 0.0;  // four-velocity, moving left
             constexpr double p_cold = 1e-6;
 
             // Solve two-shock Riemann problem
@@ -642,13 +745,13 @@ struct compute_edge_velocities_t {
         // Zone i0-1 is in guard region (from neighbor or BC), zone i0 is interior
         auto v_l_inner = beta(p.prim[i0 - 1]);
         auto v_r_inner = beta(p.prim[i0]);
-        p.grid.v_inner = 0.5 * (v_l_inner + v_r_inner);
+        p.grid.v_inner = 0.0; //0.5 * (v_l_inner + v_r_inner);
 
         // Outer edge velocity: average of gas velocities in adjacent zones
         // Zone i1 is interior, zone i1+1 is in guard region (from neighbor or BC)
         auto v_l_outer = beta(p.prim[i1]);
         auto v_r_outer = beta(p.prim[i1 + 1]);
-        p.grid.v_outer = 0.5 * (v_l_outer + v_r_outer);
+        p.grid.v_outer = 0.0; //0.5 * (v_l_outer + v_r_outer);
 
         return p;
     }
@@ -677,11 +780,15 @@ struct update_conserved_t {
 
         for_each(p.interior, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            auto rl = p.grid.face_radius(i, t);
-            auto rr = p.grid.face_radius(i + 1, t);
-            auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
             p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt;
-            p.cons[i] += source * dt;
+
+            // Apply geometric source terms only for spherical geometry
+            if (p.grid.geom == geometry::spherical) {
+                auto rl = p.grid.face_radius(i, t);
+                auto rr = p.grid.face_radius(i + 1, t);
+                auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
+                p.cons[i] += source * dt;
+            }
         });
         p.time += p.dt;
         return p;
@@ -766,6 +873,7 @@ struct srhd {
         double outer_radius = 1.0;
         double tstart = 0.0;
         initial_condition ic = initial_condition::uniform;
+        geometry geom = geometry::spherical;
 
         auto fields() const {
             return std::make_tuple(
@@ -774,7 +882,8 @@ struct srhd {
                 field("inner_radius", inner_radius),
                 field("outer_radius", outer_radius),
                 field("tstart", tstart),
-                field("ic", ic)
+                field("ic", ic),
+                field("geom", geom)
             );
         }
 
@@ -785,7 +894,8 @@ struct srhd {
                 field("inner_radius", inner_radius),
                 field("outer_radius", outer_radius),
                 field("tstart", tstart),
-                field("ic", ic)
+                field("ic", ic),
+                field("geom", geom)
             );
         }
     };
@@ -840,7 +950,7 @@ auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
 }
 
 auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
-    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .tstart = 0.0, .ic = initial_condition::uniform};
+    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .tstart = 0.0, .ic = initial_condition::uniform, .geom = geometry::spherical};
 }
 
 auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
@@ -855,7 +965,8 @@ auto initial_state(const srhd::exec_context_t& ctx) -> srhd::state_t {
         ini.outer_radius,
         0.0,  // v_inner computed dynamically from gas velocities
         0.0,  // v_outer computed dynamically from gas velocities
-        ini.num_zones
+        ini.num_zones,
+        ini.geom
     };
 
     auto patches = to_vector(iota(0, np) | transform([&](int p) {
@@ -875,7 +986,8 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
         ini.outer_radius,
         0.0,  // v_inner computed dynamically from gas velocities
         0.0,  // v_outer computed dynamically from gas velocities
-        ini.num_zones
+        ini.num_zones,
+        ini.geom
     };
 
     auto new_step = parallel::pipeline(
