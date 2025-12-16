@@ -316,6 +316,35 @@ static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> c
 }
 
 // =============================================================================
+// Riemann solver types
+// =============================================================================
+
+enum class riemann_solver {
+    hlle,
+    hllc,
+    two_shock,  // not implemented yet
+    exact       // not implemented yet
+};
+
+auto to_string(riemann_solver rs) -> const char* {
+    switch (rs) {
+        case riemann_solver::hlle: return "hlle";
+        case riemann_solver::hllc: return "hllc";
+        case riemann_solver::two_shock: return "two_shock";
+        case riemann_solver::exact: return "exact";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<riemann_solver>, const std::string& s) -> riemann_solver {
+    if (s == "hlle") return riemann_solver::hlle;
+    if (s == "hllc") return riemann_solver::hllc;
+    if (s == "two_shock") return riemann_solver::two_shock;
+    if (s == "exact") return riemann_solver::exact;
+    throw std::runtime_error("unknown riemann_solver: " + s);
+}
+
+// =============================================================================
 // Geometry
 // =============================================================================
 
@@ -759,6 +788,8 @@ struct compute_edge_velocities_t {
 
 struct compute_fluxes_t {
     static constexpr const char* name = "compute_fluxes";
+    riemann_solver solver = riemann_solver::hllc;
+
     auto value(patch_t p) const -> patch_t {
         for_each(space(p.fhat), [&](ivec_t<1> idx) {
             auto i = idx[0];
@@ -766,7 +797,21 @@ struct compute_fluxes_t {
             auto vf = p.grid.face_velocity(i);
             auto pl = p.prim[i - 1] + p.grad[i - 1] * 0.5;
             auto pr = p.prim[i + 0] - p.grad[i + 0] * 0.5;
-            p.fhat[i] = riemann_hlle(pl, pr, prim_to_cons(pl), prim_to_cons(pr), vf) * da;
+            auto ul = prim_to_cons(pl);
+            auto ur = prim_to_cons(pr);
+
+            switch (solver) {
+                case riemann_solver::hlle:
+                    p.fhat[i] = riemann_hlle(pl, pr, ul, ur, vf) * da;
+                    break;
+                case riemann_solver::hllc:
+                    p.fhat[i] = riemann_hllc(pl, pr, ul, ur, vf) * da;
+                    break;
+                case riemann_solver::two_shock:
+                    throw std::runtime_error("two_shock riemann solver not implemented for flux calculation");
+                case riemann_solver::exact:
+                    throw std::runtime_error("exact riemann solver not implemented");
+            }
         });
         return p;
     }
@@ -844,6 +889,7 @@ struct srhd {
         double plm_theta = 1.5;
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
+        riemann_solver riemann = riemann_solver::hllc;
 
         auto fields() const {
             return std::make_tuple(
@@ -851,7 +897,8 @@ struct srhd {
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
                 field("bc_lo", bc_lo),
-                field("bc_hi", bc_hi)
+                field("bc_hi", bc_hi),
+                field("riemann", riemann)
             );
         }
 
@@ -861,7 +908,8 @@ struct srhd {
                 field("cfl", cfl),
                 field("plm_theta", plm_theta),
                 field("bc_lo", bc_lo),
-                field("bc_hi", bc_hi)
+                field("bc_hi", bc_hi),
+                field("riemann", riemann)
             );
         }
     };
@@ -946,7 +994,7 @@ struct srhd {
 // =============================================================================
 
 auto default_physics_config(std::type_identity<srhd>) -> srhd::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow};
+    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc};
 }
 
 auto default_initial_config(std::type_identity<srhd>) -> srhd::initial_t {
@@ -1003,7 +1051,7 @@ void advance(srhd::state_t& state, const srhd::exec_context_t& ctx) {
         cons_to_prim_t{},
         compute_gradients_t{},
         compute_edge_velocities_t{},
-        compute_fluxes_t{},
+        compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );
 
