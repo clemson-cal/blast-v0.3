@@ -1,9 +1,18 @@
-set initial num_zones=100 inner_radius=0.0 outer_radius=1.0 ic=mignone_bodo geom=planar
-set physics rk_order=1 cfl=0.8 bc_lo=outflow bc_hi=outflow plm_theta=0.0
+set initial num_zones=100
+set initial inner_radius=0.0
+set initial outer_radius=10.0
+set initial ic=mignone_bodo
+set initial geom=planar
+set initial tstart=0.5
+set physics rk_order=1
+set physics cfl=0.8
+set physics bc_lo=outflow
+set physics bc_hi=outflow
+set physics plm_theta=0.0
 set output=ascii
-repeat 0.01 t show message
+repeat 0.01 t show iteration
 init
-t -> 0.4
+# t -> 0.4
 show all
 select products
 write products

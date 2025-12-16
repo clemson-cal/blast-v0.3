@@ -1,6 +1,6 @@
 set initial num_zones=2000
 init
-repeat 0.01 t show message
+repeat 0.01 t show iteration
 t += 0.2
 select products
 write products

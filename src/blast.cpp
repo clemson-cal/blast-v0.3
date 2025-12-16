@@ -555,7 +555,7 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
             constexpr double ul = 10.0;   // four-velocity, moving right
             constexpr double dr = 1.0;
             constexpr double ur = 0.0;  // four-velocity, moving left
-            constexpr double p_cold = 1e-6;
+            constexpr double cold_temp = 1e-6;
 
             // Solve two-shock Riemann problem
             auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
@@ -573,7 +573,7 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
             // Determine which region r falls into
             if (r < r_rs) {
                 // Region 4: original left state
-                return prim_t{dl, ul, p_cold * dl};
+                return prim_t{dl, ul, cold_temp * dl};
             } else if (r < r_cd) {
                 // Region 3: shocked left material
                 return prim_t{sol.d3, sol.u, sol.p};
@@ -582,7 +582,7 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
                 return prim_t{sol.d2, sol.u, sol.p};
             } else {
                 // Region 1: original right state
-                return prim_t{dr, ur, p_cold * dr};
+                return prim_t{dr, ur, cold_temp * dr};
             }
         }
         case initial_condition::mignone_bodo:
@@ -643,10 +643,10 @@ struct patch_t {
     std::vector<cons_t> fhat_edge;        // size Ne+1, flux density at element boundaries
 
     cached_t<cons_t, 1> cons;
-    cached_t<cons_t, 1> cons_rk;  // RK cached state
-    mutable cached_t<prim_t, 1> prim;  // primitive variables at cell centers
-    cached_t<prim_t, 1> grad;     // PLM gradients at cell centers
-    cached_t<cons_t, 1> fhat;     // Godunov fluxes at faces
+    cached_t<cons_t, 1> cons_rk;          // RK cached state
+    mutable cached_t<prim_t, 1> prim;     // primitive variables at cell centers
+    cached_t<prim_t, 1> grad;             // PLM gradients at cell centers
+    cached_t<cons_t, 1> fhat;             // Godunov fluxes at faces
 
     patch_t() = default;
 
@@ -960,7 +960,10 @@ struct classify_element_boundaries_t {
 
             double v = 0.0;
 
-            // New spec classification algorithm:
+            // ------------------------------
+            // Edge classification algorithm:
+            // ------------------------------
+
             // Step 1: Check if density is discontinuous
             if (!has_density_jump(pL, pR, tol_rho)) {
                 // Density is continuous → neither shock nor contact

@@ -8,7 +8,7 @@ set physics outer_radius=2.0
 set physics v_inner=0.5
 set physics v_outer=0.5
 set output=binary
-repeat 0.01 t show message
+repeat 0.01 t show iteration
 select products
 show all
 init

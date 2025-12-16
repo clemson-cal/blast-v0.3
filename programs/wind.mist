@@ -1,5 +1,10 @@
-set initial num_zones=2000 inner_radius=1.0 outer_radius=2.0 ic=wind
-set physics rk_order=2 bc_lo=inflow bc_hi=inflow
+set initial num_zones=2000
+set initial inner_radius=1.0
+set initial outer_radius=2.0
+set initial ic=wind
+set physics rk_order=2
+set physics bc_lo=inflow
+set physics bc_hi=inflow
 set output=binary
 repeat 0.01 t show message
 init
