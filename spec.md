@@ -2,8 +2,6 @@
 
 A modification to the existing 1D SRHD code that decomposes the domain into moving subdomains (elements) whose boundaries track shocks and contacts.
 
-> **TODO**: The shock velocity estimation algorithm (using `dF/dU` from Rankine-Hugoniot) does not work reliably in practice. This spec will be updated with a better algorithm for estimating subdomain edge velocities at shocks.
-
 ---
 
 ## Subdomain Structure
@@ -58,38 +56,47 @@ cell_radius(i) = 0.5 * (r_face(i) + r_face(i+1))
 
 ## Discontinuity Detection
 
-### Contact Condition
-A contact exists if **all** of:
-- `reldiff(uL, uR) <= tol_up`
-- `reldiff(pL, pR) <= tol_up`
-- `reldiff(ρL, ρR) >= tol_rho_jump`
+All checks use tolerance parameters for numerical robustness.
 
+### Classification Algorithm
+
+**Step 1: Check density continuity**
+- If `reldiff(ρL, ρR) < tol_rho`: density is continuous → **neither shock nor contact** (edge_type = 0)
+
+**Step 2: Check four-velocity continuity** (given density is discontinuous)
+- If `reldiff(uL, uR) > tol_u`: four-velocity is discontinuous → **shock** (edge_type = 2)
+- If `reldiff(uL, uR) < tol_u`: four-velocity is continuous → **contact** (edge_type = 1)
+
+### Edge Velocity Computation
+
+**Shock (edge_type = 2):**
 ```cpp
-v = beta(PL);
-// the flux across the discontinuity is:
-fhat = FL - UL * v = FR - UR * v // these are close within tol (can use average)
+gamma_rel = sqrt(1.0 + u_u * u_u) * sqrt(1.0 + u_d * u_d) - u_u * u_d;
+gamma_index = 4.0 / 3.0;
+gamma_shock = sqrt((gamma_rel + 1.0) * pow(gamma_index * (gamma_rel - 1.0) + 1.0, 2)
+                   / (gamma_index * (2.0 - gamma_index) * (gamma_rel - 1.0) + 2.0));
+beta_shock = -sqrt(1.0 - 1.0 / (gamma_shock * gamma_shock));
+beta_d = u_d / sqrt(1.0 + u_d * u_d);
+v_edge[k] = (beta_d + beta_shock) / (1.0 + beta_d * beta_shock);
+```
+where `u_u` is upstream four-velocity and `u_d` is downstream four-velocity.
+
+**Contact (edge_type = 1):**
+```cpp
+v_edge[k] = 0.5 * (beta(PL) + beta(PR));  // average of adjacent fluid velocities
 ```
 
-### Shock Condition
+**Neither (edge_type = 0):**
 ```cpp
-dU = UR - UL;
-dF = FR - FL;
-
-sD = dF[D] / dU[D];  // inferred speeds
-sS = dF[S] / dU[S];
-sE = dF[E] / dU[E];
-
-// Require all speeds agree within tolerance
-v = (sD + sS + sE) / 3;
-// the flux across the discontinuity is:
-fhat = FL - UL * v = FR - UR * v // these are close within tol (can use average)
+v_edge[k] = 0.5 * (beta(PL) + beta(PR));  // same as contact case
 ```
 
-### Classification
+### Flux at Discontinuities
+
+For edges with `edge_type > 0`:
 ```cpp
-if (contact_passes)      { edge_type[k] = 1; v_edge[k] = v; }
-else if (shock_passes)   { edge_type[k] = 2; v_edge[k] = v; }
-else                     { edge_type[k] = 0; v_edge[k] = 1/2 * (vl + vr); } // <- FIXED; vl and vr are the fluid speeds in zones adjacent to the subdomain edge
+// Use interior-biased gradients relative to the boundary
+fhat_density[k] = FL - v_edge[k] * UL;  // or FR - v_edge[k] * UR (should be close)
 ```
 
 ---
