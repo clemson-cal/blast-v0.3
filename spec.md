@@ -196,3 +196,90 @@ dt = cfl * grid.dr / max_wavespeed;
 ## Serialization
 
 Only `edges` must be serialized for restarts. Derived quantities (`v_edge`, `edge_type`, `fhat`) are recomputed.
+
+---
+
+## Alternative Prescription: Shocks as Domain Boundaries (Four-State)
+
+For the `four_state` initial condition, an alternative approach is to evolve only the shocked regions with the shocks serving as the physical domain boundaries.
+
+### Setup
+
+- **Patches**: 2 (not 4)
+  - Patch 0: Shocked left material (region 3), domain [r_rs, r_cd]
+  - Patch 1: Shocked right material (region 2), domain [r_cd, r_fs]
+- **Unshocked material**: Not on the grid (regions 1 and 4 are external)
+- **Domain boundaries**: ARE the shocks (r_rs and r_fs)
+
+### Initialization
+
+At `tstart`, compute analytical shock positions and velocities:
+
+```cpp
+// Solve two-shock Riemann problem
+auto sol = riemann::solve_two_shock(d_L, u_L, d_R, u_R);
+auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({d_L, u_L, d_R, u_R}, sol);
+
+// Discontinuity positions at tstart (launched from r=1.0 at t=0)
+double r_rs = 1.0 + v_rs * tstart;  // reverse shock
+double r_cd = 1.0 + v_cd * tstart;  // contact discontinuity
+double r_fs = 1.0 + v_fs * tstart;  // forward shock
+
+// Patch 0: [r_rs, r_cd]
+patch[0].r0 = r_rs;
+patch[0].r1 = r_cd;
+patch[0].v0 = v_rs;  // reverse shock velocity
+patch[0].v1 = v_cd;  // contact velocity
+patch[0].e0 = edge_type::shock;
+patch[0].e1 = edge_type::contact;
+
+// Patch 1: [r_cd, r_fs]
+patch[1].r0 = r_cd;
+patch[1].r1 = r_fs;
+patch[1].v0 = v_cd;  // contact velocity
+patch[1].v1 = v_fs;  // forward shock velocity
+patch[1].e0 = edge_type::contact;
+patch[1].e1 = edge_type::shock;
+
+// Initialize with shocked states from two-shock solution
+// Patch 0: d3, u, p (shocked left)
+// Patch 1: d2, u, p (shocked right)
+```
+
+### Evolution
+
+**Edge velocities**: Preserve analytical values throughout evolution. Do NOT override with dynamically computed values from `classify_patch_edges_t`.
+
+**Discontinuity fluxes**: Compute using interior states and analytical velocities:
+```cpp
+if (ic == initial_condition::four_state) {
+    // Skip dynamic classification, use analytical velocities
+    if (p.e0 != edge_type::generic) {
+        auto pR = p.prim[i0];
+        auto uR = prim_to_cons(pR);
+        auto fR = prim_and_cons_to_flux(pR, uR);
+        p.discontinuity_flux_l = fR - uR * p.v0;  // p.v0 is analytical
+    }
+
+    if (p.e1 != edge_type::generic) {
+        auto pL = p.prim[i1 - 1];
+        auto uL = prim_to_cons(pL);
+        auto fL = prim_and_cons_to_flux(pL, uL);
+        p.discontinuity_flux_r = fL - uL * p.v1;  // p.v1 is analytical
+    }
+}
+```
+
+### Rationale
+
+This approach treats the shocks as true boundaries of the computational domain rather than as internal features. The unshocked material is handled analytically (positions and velocities from the two-shock Riemann solution) rather than being explicitly represented on the grid.
+
+**Advantages**:
+- Avoids very small patches at early times
+- Cleaner separation between shocked and unshocked regions
+- Domain boundaries have clear physical meaning
+
+**Challenges**:
+- Domain boundaries are moving (shocks)
+- Need to ensure proper flux treatment at shock boundaries
+- CFL constraint may be severe if patches remain narrow
