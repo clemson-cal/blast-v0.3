@@ -154,7 +154,8 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
     auto ss = momentum_squared(cons);
     auto w0 = 0.0;
 
-    for (int n = 0; n < newton_iter_max; ++n) {
+    int n;
+    for (n = 0; n < newton_iter_max; ++n) {
         auto et = tau + p + m;
         auto b2 = min2(ss / et / et, 1.0 - 1e-10);
         auto w2 = 1.0 / (1.0 - b2);
@@ -171,6 +172,9 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
             break;
         }
         p -= f / g;
+    }
+    if (n == newton_iter_max) {
+        throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
     }
     return prim_t{m / w0, w0 * cons[1] / (tau + m + p), p};
 }
