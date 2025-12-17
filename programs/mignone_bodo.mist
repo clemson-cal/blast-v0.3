@@ -1,7 +1,7 @@
 set initial num_zones=100
 set initial inner_radius=0.0
 set initial outer_radius=10.0
-set initial ic=mignone_bodo
+set initial model=mignone_bodo
 set initial geom=planar
 set initial tstart=0.5
 set physics rk_order=1

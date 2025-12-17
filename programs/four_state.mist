@@ -1,9 +1,9 @@
-set initial ic=four_state
+set initial model=four_state
 set initial tstart=0.5
 set initial inner_radius=0.5
 set initial outer_radius=1.5
 set initial num_zones=2000
-set initial num_partitions=4
+set initial num_patches=4
 set initial geom=planar
 set initial four_state_ul=+1.0
 set initial four_state_ur=-1.0

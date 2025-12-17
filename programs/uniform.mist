@@ -1,5 +1,5 @@
 set initial num_zones=20000
-set initial ic=uniform
+set initial model=uniform
 set physics rk_order=2
 set physics bc_lo=inflow
 set physics bc_hi=inflow

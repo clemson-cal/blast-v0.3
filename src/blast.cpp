@@ -109,7 +109,7 @@ auto from_string(std::type_identity<riemann_solver>, const std::string& s) -> ri
     throw std::runtime_error("unknown riemann_solver: " + s);
 }
 
-enum class initial_condition {
+enum class external_model {
     sod,
     blast_wave,
     wind,
@@ -118,25 +118,25 @@ enum class initial_condition {
     mignone_bodo,
 };
 
-auto to_string(initial_condition ic) -> const char* {
-    switch (ic) {
-        case initial_condition::sod: return "sod";
-        case initial_condition::blast_wave: return "blast_wave";
-        case initial_condition::wind: return "wind";
-        case initial_condition::uniform: return "uniform";
-        case initial_condition::four_state: return "four_state";
-        case initial_condition::mignone_bodo: return "mignone_bodo";
+auto to_string(external_model model) -> const char* {
+    switch (model) {
+        case external_model::sod: return "sod";
+        case external_model::blast_wave: return "blast_wave";
+        case external_model::wind: return "wind";
+        case external_model::uniform: return "uniform";
+        case external_model::four_state: return "four_state";
+        case external_model::mignone_bodo: return "mignone_bodo";
     }
     return "unknown";
 }
 
-auto from_string(std::type_identity<initial_condition>, const std::string& s) -> initial_condition {
-    if (s == "sod") return initial_condition::sod;
-    if (s == "blast_wave") return initial_condition::blast_wave;
-    if (s == "wind") return initial_condition::wind;
-    if (s == "uniform") return initial_condition::uniform;
-    if (s == "four_state") return initial_condition::four_state;
-    if (s == "mignone_bodo") return initial_condition::mignone_bodo;
+auto from_string(std::type_identity<external_model>, const std::string& s) -> external_model {
+    if (s == "sod") return external_model::sod;
+    if (s == "blast_wave") return external_model::blast_wave;
+    if (s == "wind") return external_model::wind;
+    if (s == "uniform") return external_model::uniform;
+    if (s == "four_state") return external_model::four_state;
+    if (s == "mignone_bodo") return external_model::mignone_bodo;
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
@@ -564,11 +564,11 @@ struct grid_t {
 
 struct initial_t {
     unsigned int num_zones = 400;
-    unsigned int num_partitions = 1;
+    unsigned int num_patches = 1;
     double inner_radius = 0.0;
     double outer_radius = 1.0;
     double tstart = 0.0;
-    initial_condition ic = initial_condition::uniform;
+    external_model model = external_model::uniform;
     geometry geom = geometry::spherical;
     double four_state_dl = 10.0;
     double four_state_ul = 10.0;
@@ -579,11 +579,11 @@ struct initial_t {
     auto fields() const {
         return std::make_tuple(
             field("num_zones", num_zones),
-            field("num_partitions", num_partitions),
+            field("num_patches", num_patches),
             field("inner_radius", inner_radius),
             field("outer_radius", outer_radius),
             field("tstart", tstart),
-            field("ic", ic),
+            field("model", model),
             field("geom", geom),
             field("four_state_dl", four_state_dl),
             field("four_state_ul", four_state_ul),
@@ -596,11 +596,11 @@ struct initial_t {
     auto fields() {
         return std::make_tuple(
             field("num_zones", num_zones),
-            field("num_partitions", num_partitions),
+            field("num_patches", num_patches),
             field("inner_radius", inner_radius),
             field("outer_radius", outer_radius),
             field("tstart", tstart),
-            field("ic", ic),
+            field("model", model),
             field("geom", geom),
             field("four_state_dl", four_state_dl),
             field("four_state_ul", four_state_ul),
@@ -611,44 +611,93 @@ struct initial_t {
     }
 };
 
-// Returns the 5 edge positions for four_state: [domain_r0, r_rs, r_cd, r_fs, domain_r1]
-static auto four_state_discontinuities(
-    double domain_r0, double domain_r1, double tstart,
-    double dl, double ul, double dr, double ur
-) -> std::array<double, 5> {
+// Returns the 3 discontinuity positions for four_state: [r_rs, r_cd, r_fs]
+static auto four_state_discontinuities(const initial_t& ini) -> std::array<double, 3> {
+    auto dl = ini.four_state_dl;
+    auto ul = ini.four_state_ul;
+    auto dr = ini.four_state_dr;
+    auto ur = ini.four_state_ur;
+
     auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
     auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
 
-    double r_rs = 1.0 + v_rs * tstart;
-    double r_cd = 1.0 + v_cd * tstart;
-    double r_fs = 1.0 + v_fs * tstart;
+    double r_rs = 1.0 + v_rs * ini.tstart;
+    double r_cd = 1.0 + v_cd * ini.tstart;
+    double r_fs = 1.0 + v_fs * ini.tstart;
 
-    return {domain_r0, r_rs, r_cd, r_fs, domain_r1};
+    return {r_rs, r_cd, r_fs};
+}
+
+// Returns patch edge positions based on initial condition
+static auto initial_patch_edges(const initial_t& ini) -> std::vector<double> {
+    auto np = ini.num_patches;
+    auto edges = std::vector<double>(np + 1);
+
+    switch (ini.model) {
+        case external_model::four_state: {
+            if (np < 2 || np % 2 != 0) {
+                throw std::runtime_error("four_state requires even number of patches >= 2");
+            }
+            auto [r_rs, r_cd, r_fs] = four_state_discontinuities(ini);
+            auto half = np / 2;
+
+            // Domain boundaries are the shocks, contact in the middle
+            edges[0] = r_rs;
+            edges[half] = r_cd;
+            edges[np] = r_fs;
+
+            // Uniform distribution between r_rs and r_cd (left half)
+            for (unsigned i = 1; i < half; ++i) {
+                double alpha = double(i) / half;
+                edges[i] = r_rs + alpha * (r_cd - r_rs);
+            }
+
+            // Uniform distribution between r_cd and r_fs (right half)
+            for (unsigned i = half + 1; i < np; ++i) {
+                double alpha = double(i - half) / half;
+                edges[i] = r_cd + alpha * (r_fs - r_cd);
+            }
+            break;
+        }
+        case external_model::sod:
+        case external_model::blast_wave:
+        case external_model::wind:
+        case external_model::uniform:
+        case external_model::mignone_bodo:
+        default:
+            // Uniform edge distribution
+            for (unsigned i = 0; i <= np; ++i) {
+                double alpha = double(i) / np;
+                edges[i] = ini.inner_radius + alpha * (ini.outer_radius - ini.inner_radius);
+            }
+            break;
+    }
+    return edges;
 }
 
 static auto external_hydrodynamics(const initial_t& ini, double r, double t) -> prim_t {
-    switch (ini.ic) {
-        case initial_condition::sod:
+    switch (ini.model) {
+        case external_model::sod:
             if (r < 1.0) {
                 return prim_t{1.0, 0.0, 1.0};
             } else {
                 return prim_t{0.125, 0.0, 0.1};
             }
-        case initial_condition::blast_wave:
+        case external_model::blast_wave:
             if (r < 1.0) {
                 return prim_t{1.0, 0.0, 1000.0};
             } else {
                 return prim_t{1.0, 0.0, 0.01};
             }
-        case initial_condition::wind: {
+        case external_model::wind: {
             auto rho = 1.0 / (r * r);
             auto u = 1.0;  // gamma-beta = 1.0
             auto pre = 1e-6 * rho;
             return prim_t{rho, u, pre};
         }
-        case initial_condition::uniform:
+        case external_model::uniform:
             return prim_t{1.0, 0.0, 1.0};
-        case initial_condition::four_state: {
+        case external_model::four_state: {
             auto dl = ini.four_state_dl;
             auto ul = ini.four_state_ul;
             auto dr = ini.four_state_dr;
@@ -680,7 +729,7 @@ static auto external_hydrodynamics(const initial_t& ini, double r, double t) -> 
                 return prim_t{dr, ur, ini.cold_temp * dr};
             }
         }
-        case initial_condition::mignone_bodo:
+        case external_model::mignone_bodo:
             if (r < 5.0) {
                 return prim_t{1.0, 2.065, 1.0};
             } else {
@@ -774,40 +823,25 @@ struct initial_state_t {
     auto value(patch_t p) const -> patch_t {
         // Compute this patch's edge positions from its index space
         auto i0 = start(p.space)[0];
-        auto i1 = upper(p.space)[0];
+        auto edges = initial_patch_edges(ini);
+        auto np = ini.num_patches;
+        unsigned zones_per_patch = ini.num_zones / np;
+        unsigned patch_idx = i0 / zones_per_patch;
 
-        if (ini.ic == initial_condition::four_state) {
-            // For four_state, align patch edges with discontinuities
-            auto edges = four_state_discontinuities(
-                ini.inner_radius, ini.outer_radius, ini.tstart,
-                ini.four_state_dl, ini.four_state_ul, ini.four_state_dr, ini.four_state_ur);
-            unsigned zones_per_patch = ini.num_zones / 4;
-            unsigned patch_idx = i0 / zones_per_patch;
+        p.truth.r0 = edges[patch_idx];
+        p.truth.r1 = edges[patch_idx + 1];
 
-            p.truth.r0 = edges[patch_idx];
-            p.truth.r1 = edges[patch_idx + 1];
-
-            // Set edge types based on position
-            // patch 0: left=domain, right=shock (reverse shock)
-            // patch 1: left=shock, right=contact
-            // patch 2: left=contact, right=shock (forward shock)
-            // patch 3: left=shock, right=domain
-            p.e0 = (patch_idx == 0) ? edge_type::generic :
-                        (patch_idx == 2) ? edge_type::contact : edge_type::shock;
-            p.e1 = (patch_idx == 3) ? edge_type::generic :
-                        (patch_idx == 1) ? edge_type::contact : edge_type::shock;
-
-            std::cerr << "patch " << patch_idx << ": r=[" << p.truth.r0 << ", " << p.truth.r1 << "]"
-                      << " e0=" << (p.e0 == edge_type::shock ? "shock" :
-                                    p.e0 == edge_type::contact ? "contact" : "generic")
-                      << " e1=" << (p.e1 == edge_type::shock ? "shock" :
-                                    p.e1 == edge_type::contact ? "contact" : "generic")
-                      << "\n";
+        if (ini.model == external_model::four_state) {
+            // Classify edge types for four_state
+            auto half = np / 2;
+            auto edge_type_of = [&](unsigned edge_idx) {
+                if (edge_idx == 0 || edge_idx == np) return edge_type::shock;
+                if (edge_idx == half) return edge_type::contact;
+                return edge_type::generic;
+            };
+            p.e0 = edge_type_of(patch_idx);
+            p.e1 = edge_type_of(patch_idx + 1);
         } else {
-            double alpha0 = double(i0) / ini.num_zones;
-            double alpha1 = double(i1) / ini.num_zones;
-            p.truth.r0 = ini.inner_radius + alpha0 * (ini.outer_radius - ini.inner_radius);
-            p.truth.r1 = ini.inner_radius + alpha1 * (ini.outer_radius - ini.inner_radius);
             p.e0 = edge_type::generic;
             p.e1 = edge_type::generic;
         }
@@ -1299,11 +1333,11 @@ auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
 auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
     return {
         .num_zones = 400,
-        .num_partitions = 1,
+        .num_patches = 1,
         .inner_radius = 0.0,
         .outer_radius = 1.0,
         .tstart = 0.0,
-        .ic = initial_condition::uniform,
+        .model = external_model::uniform,
         .geom = geometry::spherical
     };
 }
@@ -1314,11 +1348,11 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
 
     auto& ini = ctx.initial;
 
-    if (ini.ic == initial_condition::four_state && ini.num_partitions != 4) {
-        throw std::runtime_error("four_state initial condition requires num_partitions=4");
+    if (ini.model == external_model::four_state && (ini.num_patches < 2 || ini.num_patches % 2 != 0)) {
+        throw std::runtime_error("four_state requires even number of patches >= 2");
     }
 
-    auto np = static_cast<int>(ini.num_partitions);
+    auto np = static_cast<int>(ini.num_patches);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
 
     auto patches = to_vector(iota(0, np) | transform([&](int p) {

@@ -1,7 +1,7 @@
 set initial num_zones=2000
 set initial inner_radius=1.0
 set initial outer_radius=2.0
-set initial ic=wind
+set initial model=wind
 set physics rk_order=2
 set physics bc_lo=inflow
 set physics bc_hi=inflow
