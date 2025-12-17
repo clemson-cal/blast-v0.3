@@ -521,6 +521,25 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
+// Returns the 5 edge positions for four_state: [domain_r0, r_rs, r_cd, r_fs, domain_r1]
+static auto four_state_edges(double domain_r0, double domain_r1, double tstart) -> std::array<double, 5> {
+    constexpr double dl = 10.0;
+    constexpr double ul = 10.0;
+    constexpr double dr = 1.0;
+    constexpr double ur = 0.0;
+
+    auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
+    auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
+    double g_cd = std::sqrt(1.0 + sol.u * sol.u);
+    double v_cd = sol.u / g_cd;
+
+    double r_rs = 1.0 + v_rs * tstart;
+    double r_cd = 1.0 + v_cd * tstart;
+    double r_fs = 1.0 + v_fs * tstart;
+
+    return {domain_r0, r_rs, r_cd, r_fs, domain_r1};
+}
+
 static auto initial_primitive(initial_condition ic, double r, double tstart = 0.0) -> prim_t {
     switch (ic) {
         case initial_condition::sod:
@@ -556,8 +575,8 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
 
             // Compute shock and contact velocities
             auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
-            double g_contact = std::sqrt(1.0 + sol.u * sol.u);
-            double v_cd = sol.u / g_contact;
+            double g_cd = std::sqrt(1.0 + sol.u * sol.u);
+            double v_cd = sol.u / g_cd;
 
             // Positions at tstart (shocks launched from r=1.0)
             double r_rs = 1.0 + v_rs * tstart;  // reverse shock position
@@ -624,6 +643,8 @@ struct patch_t {
     double dt = 0.0;
     double time = 0.0;
     double time_rk = 0.0;
+    double r0_rk = 0.0;
+    double r1_rk = 0.0;
     double plm_theta = 1.5;
 
     cached_t<cons_t, 1> cons;
@@ -662,15 +683,43 @@ struct initial_state_t {
         // Compute this patch's edge positions from its index space
         auto i0 = start(p.grid.space)[0];
         auto i1 = upper(p.grid.space)[0];
-        double alpha0 = double(i0) / num_zones;
-        double alpha1 = double(i1) / num_zones;
 
-        p.grid.r0 = domain_r0 + alpha0 * (domain_r1 - domain_r0);
-        p.grid.r1 = domain_r0 + alpha1 * (domain_r1 - domain_r0);
+        if (ic == initial_condition::four_state) {
+            // For four_state, align patch edges with discontinuities
+            auto edges = four_state_edges(domain_r0, domain_r1, tstart);
+            unsigned zones_per_patch = num_zones / 4;
+            unsigned patch_idx = i0 / zones_per_patch;
+
+            p.grid.r0 = edges[patch_idx];
+            p.grid.r1 = edges[patch_idx + 1];
+
+            // Set edge types based on position
+            // patch 0: left=domain, right=shock (reverse shock)
+            // patch 1: left=shock, right=contact
+            // patch 2: left=contact, right=shock (forward shock)
+            // patch 3: left=shock, right=domain
+            p.grid.e0 = (patch_idx == 0) ? edge_type::generic :
+                        (patch_idx == 2) ? edge_type::contact : edge_type::shock;
+            p.grid.e1 = (patch_idx == 3) ? edge_type::generic :
+                        (patch_idx == 1) ? edge_type::contact : edge_type::shock;
+
+            std::cerr << "patch " << patch_idx << ": r=[" << p.grid.r0 << ", " << p.grid.r1 << "]"
+                      << " e0=" << (p.grid.e0 == edge_type::shock ? "shock" :
+                                    p.grid.e0 == edge_type::contact ? "contact" : "generic")
+                      << " e1=" << (p.grid.e1 == edge_type::shock ? "shock" :
+                                    p.grid.e1 == edge_type::contact ? "contact" : "generic")
+                      << "\n";
+        } else {
+            double alpha0 = double(i0) / num_zones;
+            double alpha1 = double(i1) / num_zones;
+            p.grid.r0 = domain_r0 + alpha0 * (domain_r1 - domain_r0);
+            p.grid.r1 = domain_r0 + alpha1 * (domain_r1 - domain_r0);
+            p.grid.e0 = edge_type::generic;
+            p.grid.e1 = edge_type::generic;
+        }
+
         p.grid.v0 = 0.0;
         p.grid.v1 = 0.0;
-        p.grid.e0 = edge_type::generic;
-        p.grid.e1 = edge_type::generic;
         p.grid.geom = geom;
         p.time = tstart;
 
@@ -714,6 +763,8 @@ struct cache_rk_t {
     static constexpr const char* name = "cache_rk";
     auto value(patch_t p) const -> patch_t {
         p.time_rk = p.time;
+        p.r0_rk = p.grid.r0;
+        p.r1_rk = p.grid.r1;
         copy(p.cons_rk, p.cons);
         return p;
     }
@@ -965,6 +1016,10 @@ struct update_conserved_t {
             }
         });
 
+        // Move grid edges
+        p.grid.r0 += p.grid.v0 * dt;
+        p.grid.r1 += p.grid.v1 * dt;
+
         p.time += p.dt;
         return p;
     }
@@ -980,6 +1035,8 @@ struct rk_average_t {
             p.cons[i] = p.cons_rk[i] * (1.0 - alpha) + p.cons[i] * alpha;
         });
         p.time = p.time_rk * (1.0 - alpha) + p.time * alpha;
+        p.grid.r0 = p.r0_rk * (1.0 - alpha) + p.grid.r0 * alpha;
+        p.grid.r1 = p.r1_rk * (1.0 - alpha) + p.grid.r1 * alpha;
         return p;
     }
 };
@@ -1146,6 +1203,11 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
     using std::views::transform;
 
     auto& ini = ctx.initial;
+
+    if (ini.ic == initial_condition::four_state && ini.num_partitions != 4) {
+        throw std::runtime_error("four_state initial condition requires num_partitions=4");
+    }
+
     auto np = static_cast<int>(ini.num_partitions);
     auto S = index_space(ivec(0), uvec(ini.num_zones));
 

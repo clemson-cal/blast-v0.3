@@ -1,0 +1,14 @@
+set initial ic=four_state
+set initial tstart=0.1
+set initial inner_radius=0.0
+set initial outer_radius=2.0
+set initial num_zones=2000
+set initial num_partitions=4
+set initial geom=planar
+repeat 0.01 t show iteration
+init
+# t += 0.1
+select products
+write products
+show profiler
+stop
