@@ -339,34 +339,34 @@ static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
     constexpr double gh = gamma_law_index;  // 4/3 (g-hat as in Blandford-McKee notation)
 
     double uu, ud;
-    double sign_shock;
+    double dir;
 
     if (pL[2] > pR[2]) {
         // Left is downstream (shocked), right is upstream (unshocked)
         ud = pL[1];
         uu = pR[1];
-        sign_shock = -1.0;  // shock propagates left to right
+        dir = +1.0;  // shock propagates left to right
     } else {
         // Right is downstream (shocked), left is upstream (unshocked)
         ud = pR[1];
         uu = pL[1];
-        sign_shock = +1.0;  // shock propagates right to left
+        dir = -1.0;  // shock propagates right to left
     }
 
     // Relative Lorentz factor
-    double gamma_rel = sqrt(1.0 + uu * uu) * sqrt(1.0 + ud * ud) - uu * ud;
+    double gl = sqrt(1.0 + uu * uu) * sqrt(1.0 + ud * ud) - uu * ud;
 
     // Shock Lorentz factor (in upstream rest frame)
-    double gamma_shock = sqrt((gamma_rel + 1.0) * pow(gh * (gamma_rel - 1.0) + 1.0, 2.0) / (gh * (2.0 - gh) * (gamma_rel - 1.0) + 2.0));
+    double gs = sqrt((gl + 1.0) * pow(gh * (gl - 1.0) + 1.0, 2.0) / (gh * (2.0 - gh) * (gl - 1.0) + 2.0));
 
     // Shock velocity in upstream rest frame
-    double beta_shock = sign_shock * sqrt(1.0 - 1.0 / (gamma_shock * gamma_shock));
+    double vs = dir * sqrt(1.0 - 1.0 / (gs * gs));
 
     // Upstream velocity in lab frame
     double vu = uu / sqrt(1.0 + uu * uu);
 
     // Boost shock velocity to lab frame using relativistic velocity addition
-    return (vu + beta_shock) / (1.0 + vu * beta_shock);
+    return (vu + vs) / (1.0 + vu * vs);
 }
 
 // Check if states satisfy shock jump conditions (Rankine-Hugoniot)
