@@ -522,9 +522,31 @@ static auto num_elements_for_ic(initial_condition ic) -> unsigned {
         case initial_condition::wind:
         case initial_condition::blast_wave:
             return 2;
+        case initial_condition::four_state:
+            return 4;  // 4 regions: unshocked left, shocked left, shocked right, unshocked right
         default:
             return 1;
     }
+}
+
+// Returns discontinuity positions for four_state: (r_rs, r_cd, r_fs)
+// These are launched from r=1.0 at t=0
+static auto four_state_discontinuity_positions(double tstart) -> std::tuple<double, double, double> {
+    constexpr double dl = 10.0;
+    constexpr double ul = 10.0;
+    constexpr double dr = 1.0;
+    constexpr double ur = 0.0;
+
+    auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
+    auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
+    double g_contact = std::sqrt(1.0 + sol.u * sol.u);
+    double v_cd = sol.u / g_contact;
+
+    double r_rs = 1.0 + v_rs * tstart;
+    double r_cd = 1.0 + v_cd * tstart;
+    double r_fs = 1.0 + v_fs * tstart;
+
+    return {r_rs, r_cd, r_fs};
 }
 
 static auto initial_primitive(initial_condition ic, double r, double tstart = 0.0) -> prim_t {
@@ -740,11 +762,29 @@ struct initial_state_t {
         p.edge_type.resize(p.Ne + 1, 0);
         p.fhat_edge.resize(p.Ne + 1, cons_t{});
 
-        // Initialize edges uniformly across domain
+        // Initialize edges based on initial condition
         double r0 = grid.r0_initial;
         double r1 = grid.r1_initial;
-        for (unsigned k = 0; k <= p.Ne; ++k) {
-            p.edges[k] = r0 + k * (r1 - r0) / p.Ne;
+
+        if (ic == initial_condition::four_state) {
+            // For four_state, align edges with discontinuity positions
+            if (p.Ne != 4) {
+                throw std::runtime_error("four_state initial condition requires exactly 4 elements");
+            }
+            if (tstart <= 0.0) {
+                throw std::runtime_error("four_state initial condition requires tstart > 0");
+            }
+            auto [r_rs, r_cd, r_fs] = four_state_discontinuity_positions(tstart);
+            p.edges[0] = r0;      // inner boundary
+            p.edges[1] = r_rs;    // reverse shock
+            p.edges[2] = r_cd;    // contact discontinuity
+            p.edges[3] = r_fs;    // forward shock
+            p.edges[4] = r1;      // outer boundary
+        } else {
+            // Default: uniform edge spacing
+            for (unsigned k = 0; k <= p.Ne; ++k) {
+                p.edges[k] = r0 + k * (r1 - r0) / p.Ne;
+            }
         }
 
         // Initialize conserved variables
