@@ -59,10 +59,115 @@ auto to_vector(R&& r) {
 }
 
 // =============================================================================
-// Math utility functions
+// Enums
 // =============================================================================
 
-static constexpr double gamma_law_index = 4.0 / 3.0;
+enum class geometry {
+    planar,
+    spherical
+};
+
+auto to_string(geometry g) -> const char* {
+    switch (g) {
+        case geometry::planar: return "planar";
+        case geometry::spherical: return "spherical";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<geometry>, const std::string& s) -> geometry {
+    if (s == "planar") return geometry::planar;
+    if (s == "spherical") return geometry::spherical;
+    throw std::runtime_error("unknown geometry: " + s);
+}
+
+enum class edge_type {
+    generic,  // neither shock nor contact
+    contact,  // contact discontinuity
+    shock     // shock
+};
+
+enum class riemann_solver {
+    hlle,
+    hllc,
+    two_shock,  // not implemented yet
+    exact       // not implemented yet
+};
+
+auto to_string(riemann_solver rs) -> const char* {
+    switch (rs) {
+        case riemann_solver::hlle: return "hlle";
+        case riemann_solver::hllc: return "hllc";
+        case riemann_solver::two_shock: return "two_shock";
+        case riemann_solver::exact: return "exact";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<riemann_solver>, const std::string& s) -> riemann_solver {
+    if (s == "hlle") return riemann_solver::hlle;
+    if (s == "hllc") return riemann_solver::hllc;
+    if (s == "two_shock") return riemann_solver::two_shock;
+    if (s == "exact") return riemann_solver::exact;
+    throw std::runtime_error("unknown riemann_solver: " + s);
+}
+
+enum class initial_condition {
+    sod,
+    blast_wave,
+    wind,
+    uniform,
+    four_state,
+    mignone_bodo,
+};
+
+auto to_string(initial_condition ic) -> const char* {
+    switch (ic) {
+        case initial_condition::sod: return "sod";
+        case initial_condition::blast_wave: return "blast_wave";
+        case initial_condition::wind: return "wind";
+        case initial_condition::uniform: return "uniform";
+        case initial_condition::four_state: return "four_state";
+        case initial_condition::mignone_bodo: return "mignone_bodo";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<initial_condition>, const std::string& s) -> initial_condition {
+    if (s == "sod") return initial_condition::sod;
+    if (s == "blast_wave") return initial_condition::blast_wave;
+    if (s == "wind") return initial_condition::wind;
+    if (s == "uniform") return initial_condition::uniform;
+    if (s == "four_state") return initial_condition::four_state;
+    if (s == "mignone_bodo") return initial_condition::mignone_bodo;
+    throw std::runtime_error("unknown initial condition: " + s);
+}
+
+enum class boundary_condition {
+    outflow,
+    inflow,
+    reflecting
+};
+
+auto to_string(boundary_condition bc) -> const char* {
+    switch (bc) {
+        case boundary_condition::outflow: return "outflow";
+        case boundary_condition::inflow: return "inflow";
+        case boundary_condition::reflecting: return "reflecting";
+    }
+    return "unknown";
+}
+
+auto from_string(std::type_identity<boundary_condition>, const std::string& s) -> boundary_condition {
+    if (s == "outflow") return boundary_condition::outflow;
+    if (s == "inflow") return boundary_condition::inflow;
+    if (s == "reflecting") return boundary_condition::reflecting;
+    throw std::runtime_error("unknown boundary condition: " + s);
+}
+
+// =============================================================================
+// Math utility functions
+// =============================================================================
 
 static inline auto min2(double a, double b) -> double {
     return a < b ? a : b;
@@ -108,6 +213,7 @@ static inline auto plm_gradient(vec_t<T, N> yl, vec_t<T, N> yc, vec_t<T, N> yr, 
 // SR Hydrodynamics functions
 // =============================================================================
 
+static constexpr double gamma_law_index = 4.0 / 3.0;
 static constexpr double four_pi = 1.0;
 
 static auto gamma_beta_squared(prim_t p) -> double {
@@ -205,6 +311,99 @@ static auto outer_wavespeeds(prim_t p) -> dvec_t<2> {
     auto k0 = std::sqrt(s2 * (1.0 - v2 + s2));
     return dvec(vn - k0, vn + k0) / (1.0 + s2);
 }
+
+static auto max_wavespeed(prim_t p) -> double {
+    auto ws = outer_wavespeeds(p);
+    return max2(std::fabs(ws[0]), std::fabs(ws[1]));
+}
+
+static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> cons_t {
+    // Eqn A8 in Zhang & MacFadyen (2006), integrated over the spherical shell
+    // between r0 and r1, and specializing to radial velocity only.
+    // Source = 4pi p (r1^2 - r0^2) to match the area-integrated fluxes
+    auto pg = p[2];
+    auto dr2 = std::pow(r1, 2) - std::pow(r0, 2);
+    auto srdot = four_pi * pg * dr2;
+    return cons_t{0.0, srdot, 0.0};
+}
+
+// =============================================================================
+// Discontinuity detection helpers
+// =============================================================================
+
+static auto reldiff(double a, double b) -> double {
+    return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
+}
+
+static auto reldiff(cons_t a, cons_t b) -> double {
+    auto diff = std::fabs(a[0] - b[0]) + std::fabs(a[1] - b[1]) + std::fabs(a[2] - b[2]);
+    auto scale = 0.5 * (std::fabs(a[0]) + std::fabs(b[0]) + std::fabs(a[1]) + std::fabs(b[1]) + std::fabs(a[2]) + std::fabs(b[2])) + 1e-14;
+    return diff / scale;
+}
+
+// Compute shock velocity using relativistic jump relations
+static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
+    using std::sqrt;
+    using std::pow;
+    constexpr double gh = gamma_law_index;  // 4/3 (g-hat as in Blandford-McKee notation)
+
+    double uu, ud;
+    double dir;
+
+    if (pL[2] > pR[2]) {
+        // Left is downstream (shocked), right is upstream (unshocked)
+        ud = pL[1];
+        uu = pR[1];
+        dir = +1.0;  // shock propagates left to right
+    } else {
+        // Right is downstream (shocked), left is upstream (unshocked)
+        ud = pR[1];
+        uu = pL[1];
+        dir = -1.0;  // shock propagates right to left
+    }
+
+    // Relative Lorentz factor
+    double gl = sqrt(1.0 + uu * uu) * sqrt(1.0 + ud * ud) - uu * ud;
+
+    // Shock Lorentz factor (in upstream rest frame)
+    double gs = sqrt((gl + 1.0) * pow(gh * (gl - 1.0) + 1.0, 2.0) / (gh * (2.0 - gh) * (gl - 1.0) + 2.0));
+
+    // Shock velocity in upstream rest frame
+    double vs = dir * sqrt(1.0 - 1.0 / (gs * gs));
+
+    // Upstream velocity in lab frame
+    double vu = uu / sqrt(1.0 + uu * uu);
+
+    // Boost shock velocity to lab frame using relativistic velocity addition
+    return (vu + vs) / (1.0 + vu * vs);
+}
+
+// Check if states satisfy shock jump conditions (Rankine-Hugoniot)
+// Returns true if F_L - v_s * U_L ~ F_R - v_s * U_R
+static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool {
+    auto v_s = compute_shock_velocity(pL, pR);
+    auto uL = prim_to_cons(pL);
+    auto uR = prim_to_cons(pR);
+    auto fL = prim_and_cons_to_flux(pL, uL);
+    auto fR = prim_and_cons_to_flux(pR, uR);
+    auto flux_L = fL - uL * v_s;
+    auto flux_R = fR - uR * v_s;
+    return reldiff(flux_L, flux_R) < shock_tol;
+}
+
+// Check if states satisfy contact discontinuity conditions
+// Returns true if v_L ~ v_R and p_L ~ p_R
+static auto satisfies_contact_jump(prim_t pL, prim_t pR, double contact_tol) -> bool {
+    auto vL = beta(pL);
+    auto vR = beta(pR);
+    auto pL_pressure = pL[2];
+    auto pR_pressure = pR[2];
+    return reldiff(vL, vR) < contact_tol && reldiff(pL_pressure, pR_pressure) < contact_tol;
+}
+
+// =============================================================================
+// Riemann solvers
+// =============================================================================
 
 static auto riemann_hlle(prim_t pl, prim_t pr, cons_t ul, cons_t ur, double v_face = 0.0) -> cons_t {
     auto fl = prim_and_cons_to_flux(pl, ul);
@@ -306,152 +505,9 @@ static auto riemann_hllc(prim_t pl, prim_t pr, cons_t ul, cons_t ur, double v_fa
     }
 }
 
-static auto max_wavespeed(prim_t p) -> double {
-    auto ws = outer_wavespeeds(p);
-    return max2(std::fabs(ws[0]), std::fabs(ws[1]));
-}
-
-static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> cons_t {
-    // Eqn A8 in Zhang & MacFadyen (2006), integrated over the spherical shell
-    // between r0 and r1, and specializing to radial velocity only.
-    // Source = 4π p (r1² - r0²) to match the area-integrated fluxes
-    auto pg = p[2];
-    auto dr2 = std::pow(r1, 2) - std::pow(r0, 2);
-    auto srdot = four_pi * pg * dr2;
-    return cons_t{0.0, srdot, 0.0};
-}
-
 // =============================================================================
-// Discontinuity detection helpers
+// Data structures
 // =============================================================================
-
-static auto reldiff(double a, double b) -> double {
-    return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
-}
-
-static auto reldiff(cons_t a, cons_t b) -> double {
-    auto diff = std::fabs(a[0] - b[0]) + std::fabs(a[1] - b[1]) + std::fabs(a[2] - b[2]);
-    auto scale = 0.5 * (std::fabs(a[0]) + std::fabs(b[0]) + std::fabs(a[1]) + std::fabs(b[1]) + std::fabs(a[2]) + std::fabs(b[2])) + 1e-14;
-    return diff / scale;
-}
-
-// Compute shock velocity using relativistic jump relations
-static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
-    using std::sqrt;
-    using std::pow;
-    constexpr double gh = gamma_law_index;  // 4/3 (g-hat as in Blandford-McKee notation)
-
-    double uu, ud;
-    double dir;
-
-    if (pL[2] > pR[2]) {
-        // Left is downstream (shocked), right is upstream (unshocked)
-        ud = pL[1];
-        uu = pR[1];
-        dir = +1.0;  // shock propagates left to right
-    } else {
-        // Right is downstream (shocked), left is upstream (unshocked)
-        ud = pR[1];
-        uu = pL[1];
-        dir = -1.0;  // shock propagates right to left
-    }
-
-    // Relative Lorentz factor
-    double gl = sqrt(1.0 + uu * uu) * sqrt(1.0 + ud * ud) - uu * ud;
-
-    // Shock Lorentz factor (in upstream rest frame)
-    double gs = sqrt((gl + 1.0) * pow(gh * (gl - 1.0) + 1.0, 2.0) / (gh * (2.0 - gh) * (gl - 1.0) + 2.0));
-
-    // Shock velocity in upstream rest frame
-    double vs = dir * sqrt(1.0 - 1.0 / (gs * gs));
-
-    // Upstream velocity in lab frame
-    double vu = uu / sqrt(1.0 + uu * uu);
-
-    // Boost shock velocity to lab frame using relativistic velocity addition
-    return (vu + vs) / (1.0 + vu * vs);
-}
-
-// Check if states satisfy shock jump conditions (Rankine-Hugoniot)
-// Returns true if F_L - v_s * U_L ≈ F_R - v_s * U_R
-static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool {
-    auto v_s = compute_shock_velocity(pL, pR);
-    auto uL = prim_to_cons(pL);
-    auto uR = prim_to_cons(pR);
-    auto fL = prim_and_cons_to_flux(pL, uL);
-    auto fR = prim_and_cons_to_flux(pR, uR);
-    auto flux_L = fL - uL * v_s;
-    auto flux_R = fR - uR * v_s;
-    return reldiff(flux_L, flux_R) < shock_tol;
-}
-
-// Check if states satisfy contact discontinuity conditions
-// Returns true if v_L ≈ v_R and p_L ≈ p_R
-static auto satisfies_contact_jump(prim_t pL, prim_t pR, double contact_tol) -> bool {
-    auto vL = beta(pL);
-    auto vR = beta(pR);
-    auto pL_pressure = pL[2];
-    auto pR_pressure = pR[2];
-    return reldiff(vL, vR) < contact_tol && reldiff(pL_pressure, pR_pressure) < contact_tol;
-}
-
-// =============================================================================
-// Riemann solver types
-// =============================================================================
-
-enum class riemann_solver {
-    hlle,
-    hllc,
-    two_shock,  // not implemented yet
-    exact       // not implemented yet
-};
-
-auto to_string(riemann_solver rs) -> const char* {
-    switch (rs) {
-        case riemann_solver::hlle: return "hlle";
-        case riemann_solver::hllc: return "hllc";
-        case riemann_solver::two_shock: return "two_shock";
-        case riemann_solver::exact: return "exact";
-    }
-    return "unknown";
-}
-
-auto from_string(std::type_identity<riemann_solver>, const std::string& s) -> riemann_solver {
-    if (s == "hlle") return riemann_solver::hlle;
-    if (s == "hllc") return riemann_solver::hllc;
-    if (s == "two_shock") return riemann_solver::two_shock;
-    if (s == "exact") return riemann_solver::exact;
-    throw std::runtime_error("unknown riemann_solver: " + s);
-}
-
-// =============================================================================
-// Geometry
-// =============================================================================
-
-enum class geometry {
-    planar,
-    spherical
-};
-
-auto to_string(geometry g) -> const char* {
-    switch (g) {
-        case geometry::planar: return "planar";
-        case geometry::spherical: return "spherical";
-    }
-    return "unknown";
-}
-
-auto from_string(std::type_identity<geometry>, const std::string& s) -> geometry {
-    if (s == "planar") return geometry::planar;
-    if (s == "spherical") return geometry::spherical;
-    throw std::runtime_error("unknown geometry: " + s);
-}
-
-enum class edge_type {
-    generic,  // neither shock nor contact
-    contact,  // contact discontinuity
-    shock     // shock
-};
 
 struct grid_t {
     double r0 = 0.0;              // left edge position
@@ -508,45 +564,6 @@ struct grid_t {
         }
     }
 };
-
-// =============================================================================
-// Initial conditions
-// =============================================================================
-
-enum class initial_condition {
-    sod,
-    blast_wave,
-    wind,
-    uniform,
-    four_state,
-    mignone_bodo,
-};
-
-auto to_string(initial_condition ic) -> const char* {
-    switch (ic) {
-        case initial_condition::sod: return "sod";
-        case initial_condition::blast_wave: return "blast_wave";
-        case initial_condition::wind: return "wind";
-        case initial_condition::uniform: return "uniform";
-        case initial_condition::four_state: return "four_state";
-        case initial_condition::mignone_bodo: return "mignone_bodo";
-    }
-    return "unknown";
-}
-
-auto from_string(std::type_identity<initial_condition>, const std::string& s) -> initial_condition {
-    if (s == "sod") return initial_condition::sod;
-    if (s == "blast_wave") return initial_condition::blast_wave;
-    if (s == "wind") return initial_condition::wind;
-    if (s == "uniform") return initial_condition::uniform;
-    if (s == "four_state") return initial_condition::four_state;
-    if (s == "mignone_bodo") return initial_condition::mignone_bodo;
-    throw std::runtime_error("unknown initial condition: " + s);
-}
-
-// =============================================================================
-// Initial configuration (defined early so initial_primitive can use it)
-// =============================================================================
 
 struct initial_t {
     unsigned int num_zones = 400;
@@ -676,43 +693,29 @@ static auto initial_primitive(const initial_t& ini, double r) -> prim_t {
     assert(false);
 }
 
-// =============================================================================
-// Boundary conditions
-// =============================================================================
-
-enum class boundary_condition {
-    outflow,
-    inflow,
-    reflecting
-};
-
-auto to_string(boundary_condition bc) -> const char* {
-    switch (bc) {
-        case boundary_condition::outflow: return "outflow";
-        case boundary_condition::inflow: return "inflow";
-        case boundary_condition::reflecting: return "reflecting";
-    }
-    return "unknown";
-}
-
-auto from_string(std::type_identity<boundary_condition>, const std::string& s) -> boundary_condition {
-    if (s == "outflow") return boundary_condition::outflow;
-    if (s == "inflow") return boundary_condition::inflow;
-    if (s == "reflecting") return boundary_condition::reflecting;
-    throw std::runtime_error("unknown boundary condition: " + s);
-}
-
-// =============================================================================
-// Patch - unified context that flows through pipeline
-// =============================================================================
-
 // Source of truth for serialization and RK averaging
-// Note: RK averaging uses lerp (linear interpolation) formula: (1-α)*a + α*b
+// Note: RK averaging uses lerp (linear interpolation) formula: (1-a)*a + a*b
 struct truth_state_t {
-    cached_t<cons_t, 1> cons;  // conserved variables (includes guard zones)
+    cached_t<cons_t, 1> cons;  // conserved variables (may or may not include guard zones)
     double time = 0.0;
-    double r0 = 0.0;           // left edge position
-    double r1 = 0.0;           // right edge position
+    double r0 = 0.0;           // position of domain interior left edge
+    double r1 = 0.0;           // position of domain interior right edge
+
+    // Return a new truth with only interior cells (guard zones stripped)
+    auto without_guard(unsigned num_guard) const -> truth_state_t {
+        auto interior = contract(space(cons), num_guard);
+        auto interior_cons = cache(map(cons[interior], std::identity{}), memory::host, exec::cpu);
+        return {std::move(interior_cons), time, r0, r1};
+    }
+
+    // Return a new truth with guard zones added (filled with zeros)
+    auto with_guard(unsigned num_guard) const -> truth_state_t {
+        auto interior = space(cons);
+        auto expanded = expand(interior, num_guard);
+        auto expanded_cons = cache(fill(expanded, cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu);
+        copy(expanded_cons[interior], cons);
+        return {std::move(expanded_cons), time, r0, r1};
+    }
 };
 
 struct patch_t {
@@ -1151,41 +1154,39 @@ struct rk_average_t {
 };
 
 // =============================================================================
-// Custom serialization for patch_t
+// Serialization
 // =============================================================================
 
 template<ArchiveWriter A>
 void serialize(A& ar, const patch_t& p) {
     ar.begin_group();
-    auto interior = cache(map(p.truth.cons[p.grid.space], std::identity{}), memory::host, exec::cpu);
-    serialize(ar, "cons", interior);
-    serialize(ar, "time", p.truth.time);
-    serialize(ar, "r0", p.truth.r0);
-    serialize(ar, "r1", p.truth.r1);
+    auto interior_truth = p.truth.without_guard(2);
+    serialize(ar, "cons", interior_truth.cons);
+    serialize(ar, "time", interior_truth.time);
+    serialize(ar, "r0", interior_truth.r0);
+    serialize(ar, "r1", interior_truth.r1);
     ar.end_group();
 }
 
 template<ArchiveReader A>
 auto deserialize(A& ar, patch_t& p) -> bool {
     if (!ar.begin_group()) return false;
-    auto interior = cached_t<cons_t, 1>{};
-    deserialize(ar, "cons", interior);
-    double time = 0.0, r0 = 0.0, r1 = 0.0;
-    deserialize(ar, "time", time);
-    deserialize(ar, "r0", r0);
-    deserialize(ar, "r1", r1);
+    auto interior_truth = truth_state_t{};
+    deserialize(ar, "cons", interior_truth.cons);
+    deserialize(ar, "time", interior_truth.time);
+    deserialize(ar, "r0", interior_truth.r0);
+    deserialize(ar, "r1", interior_truth.r1);
     ar.end_group();
-    p = patch_t(space(interior));
-    copy(p.truth.cons[p.grid.space], interior);
-    p.truth.time = time;
-    p.truth.r0 = r0;
-    p.truth.r1 = r1;
+
+    auto interior_space = space(interior_truth.cons);
+    p = patch_t(interior_space);
+    p.truth = interior_truth.with_guard(2);
     p.sync_grid_from_truth();
     return true;
 }
 
 // =============================================================================
-// 1D Special Relativistic Hydrodynamics Physics Module
+// Physics module
 // =============================================================================
 
 struct blast {
@@ -1197,8 +1198,8 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
-        double shock_tol = 0.1;    // shock jump condition tolerance
-        double contact_tol = 0.1;  // contact jump condition tolerance
+        double shock_tol = 1e-6;    // shock jump condition tolerance
+        double contact_tol = 1e-6;  // contact jump condition tolerance
 
         auto fields() const {
             return std::make_tuple(
@@ -1271,15 +1272,32 @@ struct blast {
 };
 
 // =============================================================================
-// Physics interface implementation
+// Physics interface
 // =============================================================================
 
 auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .shock_tol = 0.1, .contact_tol = 0.1};
+    return {
+        .rk_order = 1,
+        .cfl = 0.4,
+        .plm_theta = 1.5,
+        .bc_lo = boundary_condition::outflow,
+        .bc_hi = boundary_condition::outflow,
+        .riemann = riemann_solver::hllc,
+        .shock_tol = 0.1,
+        .contact_tol = 0.1
+    };
 }
 
 auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
-    return {.num_zones = 400, .num_partitions = 1, .inner_radius = 0.0, .outer_radius = 1.0, .tstart = 0.0, .ic = initial_condition::uniform, .geom = geometry::spherical};
+    return {
+        .num_zones = 400,
+        .num_partitions = 1,
+        .inner_radius = 0.0,
+        .outer_radius = 1.0,
+        .tstart = 0.0,
+        .ic = initial_condition::uniform,
+        .geom = geometry::spherical
+    };
 }
 
 auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
