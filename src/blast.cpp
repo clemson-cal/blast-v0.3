@@ -274,8 +274,7 @@ static auto riemann_hllc(prim_t pl, prim_t pr, cons_t ul, cons_t ur, double v_fa
         auto a_star = quadratic_root(fe_hll, -fm_hll - ue_hll, um_hll);
         auto p_star = -fe_hll * a_star + fm_hll;
         if (std::isnan(a_star)) {
-            std::cerr << "a* is NaN, pl = [" << pl[0] << ", " << pl[1] << ", " << pl[2]
-                      << "], pr = [" << pr[0] << ", " << pr[1] << ", " << pr[2] << "]\n";
+            throw std::runtime_error("riemann_hllc: a* is NaN");
         }
         return {a_star, p_star};
     };
@@ -707,33 +706,52 @@ auto from_string(std::type_identity<boundary_condition>, const std::string& s) -
 // Patch - unified context that flows through pipeline
 // =============================================================================
 
-struct patch_t {
-    grid_t grid;
-    double dt = 0.0;
+// Source of truth for serialization and RK averaging
+// Note: RK averaging uses lerp (linear interpolation) formula: (1-α)*a + α*b
+struct truth_state_t {
+    cached_t<cons_t, 1> cons;  // conserved variables (includes guard zones)
     double time = 0.0;
-    double time_rk = 0.0;
-    double r0_rk = 0.0;
-    double r1_rk = 0.0;
+    double r0 = 0.0;           // left edge position
+    double r1 = 0.0;           // right edge position
+};
+
+struct patch_t {
+    grid_t grid;               // geometry and derived edge info (synced from truth)
+    double dt = 0.0;
     double plm_theta = 1.5;
 
-    cached_t<cons_t, 1> cons;
-    cached_t<cons_t, 1> cons_rk;          // RK cached state
-    mutable cached_t<prim_t, 1> prim;     // primitive variables at cell centers
-    cached_t<prim_t, 1> grad;             // PLM gradients at cell centers
-    cached_t<cons_t, 1> fhat;             // Godunov fluxes at faces
-    std::optional<cons_t> discontinuity_flux_l;  // flux density at left edge (if discontinuity)
-    std::optional<cons_t> discontinuity_flux_r;  // flux density at right edge (if discontinuity)
+    truth_state_t truth;       // current state
+    truth_state_t truth_rk;    // cached state for RK averaging
+
+    // Temporary buffers (mutable, recomputed each step)
+    mutable cached_t<prim_t, 1> prim;
+    mutable cached_t<prim_t, 1> grad;
+    mutable cached_t<cons_t, 1> fhat;
+    mutable std::optional<cons_t> discontinuity_flux_l;
+    mutable std::optional<cons_t> discontinuity_flux_r;
 
     patch_t() = default;
 
     patch_t(index_space_t<1> s)
         : grid{0.0, 0.0, 0.0, 0.0, s, edge_type::generic, edge_type::generic, geometry::spherical}
-        , cons(cache(fill(expand(s, 2), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
-        , cons_rk(cache(fill(expand(s, 2), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
+        , truth{cache(fill(expand(s, 2), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu), 0.0, 0.0, 0.0}
+        , truth_rk{cache(fill(expand(s, 2), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu), 0.0, 0.0, 0.0}
         , prim(cache(fill(expand(s, 2), prim_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
         , grad(cache(fill(expand(s, 1), prim_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
         , fhat(cache(fill(index_space(start(s), shape(s) + uvec(1)), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
     {
+    }
+
+    // Sync grid positions from truth
+    void sync_grid_from_truth() {
+        grid.r0 = truth.r0;
+        grid.r1 = truth.r1;
+    }
+
+    // Sync truth positions from grid
+    void sync_truth_from_grid() {
+        truth.r0 = grid.r0;
+        truth.r1 = grid.r1;
     }
 };
 
@@ -789,7 +807,8 @@ struct initial_state_t {
         p.grid.v0 = 0.0;
         p.grid.v1 = 0.0;
         p.grid.geom = ini.geom;
-        p.time = ini.tstart;
+        p.truth.time = ini.tstart;
+        p.sync_truth_from_grid();
 
         // Initialize conserved variables
         for_each(p.grid.space, [&](ivec_t<1> idx) {
@@ -798,7 +817,7 @@ struct initial_state_t {
             auto dv = p.grid.cell_volume(i);
             auto prim = initial_primitive(ini, rc);
             auto cons = prim_to_cons(prim);
-            p.cons[i] = cons * dv;
+            p.truth.cons[i] = cons * dv;
         });
         return p;
     }
@@ -830,10 +849,10 @@ struct local_dt_t {
 struct cache_rk_t {
     static constexpr const char* name = "cache_rk";
     auto value(patch_t p) const -> patch_t {
-        p.time_rk = p.time;
-        p.r0_rk = p.grid.r0;
-        p.r1_rk = p.grid.r1;
-        copy(p.cons_rk, p.cons);
+        p.truth_rk.time = p.truth.time;
+        p.truth_rk.r0 = p.truth.r0;
+        p.truth_rk.r1 = p.truth.r1;
+        copy(p.truth_rk.cons, p.truth.cons);
         return p;
     }
 };
@@ -844,7 +863,7 @@ struct cons_to_prim_t {
         for_each(space(p.prim), [&](ivec_t<1> idx) {
             auto i = idx[0];
             auto dv = p.grid.cell_volume(i);
-            p.prim[i] = cons_to_prim(p.cons[i] / dv);
+            p.prim[i] = cons_to_prim(p.truth.cons[i] / dv);
         });
         return p;
     }
@@ -882,12 +901,12 @@ struct exchange_cons_guard_t {
         auto hi = upper(p.grid.space);
         auto l_guard = index_space(lo - ivec(2), uvec(2));
         auto r_guard = index_space(hi, uvec(2));
-        request(p.cons[l_guard]);
-        request(p.cons[r_guard]);
+        request(p.truth.cons[l_guard]);
+        request(p.truth.cons[r_guard]);
     }
 
     auto data(const patch_t& p) const -> array_view_t<const cons_t, 1> {
-        return p.cons[p.grid.space];
+        return p.truth.cons[p.grid.space];
     }
 };
 
@@ -906,8 +925,8 @@ struct apply_cons_boundary_conditions_t {
             switch (bc_lo) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0] / p.grid.cell_volume(i0));
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * p.grid.cell_volume(i0 - 1 - g);
+                        auto prim = cons_to_prim(p.truth.cons[i0] / p.grid.cell_volume(i0));
+                        p.truth.cons[i0 - 1 - g] = prim_to_cons(prim) * p.grid.cell_volume(i0 - 1 - g);
                     }
                     break;
                 case boundary_condition::inflow:
@@ -915,14 +934,14 @@ struct apply_cons_boundary_conditions_t {
                         auto i = i0 - 1 - g;
                         auto r = p.grid.cell_radius(i);
                         auto prim = initial_primitive(ini, r);
-                        p.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
+                        p.truth.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i0 + g] / p.grid.cell_volume(i0 + g));
+                        auto prim = cons_to_prim(p.truth.cons[i0 + g] / p.grid.cell_volume(i0 + g));
                         prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i0 - 1 - g] = prim_to_cons(prim) * p.grid.cell_volume(i0 - 1 - g);
+                        p.truth.cons[i0 - 1 - g] = prim_to_cons(prim) * p.grid.cell_volume(i0 - 1 - g);
                     }
                     break;
             }
@@ -933,8 +952,8 @@ struct apply_cons_boundary_conditions_t {
             switch (bc_hi) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1] / p.grid.cell_volume(i1));
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * p.grid.cell_volume(i1 + 1 + g);
+                        auto prim = cons_to_prim(p.truth.cons[i1] / p.grid.cell_volume(i1));
+                        p.truth.cons[i1 + 1 + g] = prim_to_cons(prim) * p.grid.cell_volume(i1 + 1 + g);
                     }
                     break;
                 case boundary_condition::inflow:
@@ -942,14 +961,14 @@ struct apply_cons_boundary_conditions_t {
                         auto i = i1 + 1 + g;
                         auto r = p.grid.cell_radius(i);
                         auto prim = initial_primitive(ini, r);
-                        p.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
+                        p.truth.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
                     }
                     break;
                 case boundary_condition::reflecting:
                     for (int g = 0; g < 2; ++g) {
-                        auto prim = cons_to_prim(p.cons[i1 - g] / p.grid.cell_volume(i1 - g));
+                        auto prim = cons_to_prim(p.truth.cons[i1 - g] / p.grid.cell_volume(i1 - g));
                         prim[1] = -prim[1];  // reflect radial velocity
-                        p.cons[i1 + 1 + g] = prim_to_cons(prim) * p.grid.cell_volume(i1 + 1 + g);
+                        p.truth.cons[i1 + 1 + g] = prim_to_cons(prim) * p.grid.cell_volume(i1 + 1 + g);
                     }
                     break;
             }
@@ -1093,38 +1112,40 @@ struct update_conserved_t {
 
         for_each(p.grid.space, [&](ivec_t<1> idx) {
             auto i = idx[0];
-            p.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt;
+            p.truth.cons[i] -= (p.fhat[i + 1] - p.fhat[i]) * dt;
 
             // Apply geometric source terms only for spherical geometry
             if (p.grid.geom == geometry::spherical) {
                 auto rl = p.grid.face_radius(i);
                 auto rr = p.grid.face_radius(i + 1);
                 auto source = spherical_geometry_source_terms(p.prim[i], rl, rr);
-                p.cons[i] += source * dt;
+                p.truth.cons[i] += source * dt;
             }
         });
 
         // Move grid edges
         p.grid.r0 += p.grid.v0 * dt;
         p.grid.r1 += p.grid.v1 * dt;
+        p.truth.time += dt;
+        p.sync_truth_from_grid();
 
-        p.time += p.dt;
         return p;
     }
 };
 
 struct rk_average_t {
     static constexpr const char* name = "rk_average";
-    double alpha;  // state = (1-alpha) * cached + alpha * current
+    double alpha;  // state = lerp(cached, current, alpha) = (1-alpha) * cached + alpha * current
 
     auto value(patch_t p) const -> patch_t {
-        for_each(space(p.cons), [&](ivec_t<1> idx) {
+        for_each(space(p.truth.cons), [&](ivec_t<1> idx) {
             auto i = idx[0];
-            p.cons[i] = p.cons_rk[i] * (1.0 - alpha) + p.cons[i] * alpha;
+            p.truth.cons[i] = p.truth_rk.cons[i] * (1.0 - alpha) + p.truth.cons[i] * alpha;
         });
-        p.time = p.time_rk * (1.0 - alpha) + p.time * alpha;
-        p.grid.r0 = p.r0_rk * (1.0 - alpha) + p.grid.r0 * alpha;
-        p.grid.r1 = p.r1_rk * (1.0 - alpha) + p.grid.r1 * alpha;
+        p.truth.time = p.truth_rk.time * (1.0 - alpha) + p.truth.time * alpha;
+        p.truth.r0 = p.truth_rk.r0 * (1.0 - alpha) + p.truth.r0 * alpha;
+        p.truth.r1 = p.truth_rk.r1 * (1.0 - alpha) + p.truth.r1 * alpha;
+        p.sync_grid_from_truth();
         return p;
     }
 };
@@ -1136,9 +1157,11 @@ struct rk_average_t {
 template<ArchiveWriter A>
 void serialize(A& ar, const patch_t& p) {
     ar.begin_group();
-    auto interior = cache(map(p.cons[p.grid.space], std::identity{}), memory::host, exec::cpu);
+    auto interior = cache(map(p.truth.cons[p.grid.space], std::identity{}), memory::host, exec::cpu);
     serialize(ar, "cons", interior);
-    serialize(ar, "time", p.time);
+    serialize(ar, "time", p.truth.time);
+    serialize(ar, "r0", p.truth.r0);
+    serialize(ar, "r1", p.truth.r1);
     ar.end_group();
 }
 
@@ -1147,12 +1170,17 @@ auto deserialize(A& ar, patch_t& p) -> bool {
     if (!ar.begin_group()) return false;
     auto interior = cached_t<cons_t, 1>{};
     deserialize(ar, "cons", interior);
-    double time = 0.0;
+    double time = 0.0, r0 = 0.0, r1 = 0.0;
     deserialize(ar, "time", time);
+    deserialize(ar, "r0", r0);
+    deserialize(ar, "r1", r1);
     ar.end_group();
     p = patch_t(space(interior));
-    copy(p.cons[p.grid.space], interior);
-    p.time = time;
+    copy(p.truth.cons[p.grid.space], interior);
+    p.truth.time = time;
+    p.truth.r0 = r0;
+    p.truth.r1 = r1;
+    p.sync_grid_from_truth();
     return true;
 }
 
@@ -1319,7 +1347,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
             throw std::runtime_error("rk_order must be 1, 2, or 3");
     }
 
-    state.time = state.patches[0].time;
+    state.time = state.patches[0].truth.time;
 }
 
 auto zone_count(const blast::state_t& state, const blast::exec_context_t& ctx) -> std::size_t {
@@ -1361,12 +1389,12 @@ auto get_timeseries(
 
     for (const auto& p : state.patches) {
         // cons stores volume-integrated quantities, so total_mass = sum of cons[0]
-        auto mass = lazy(p.grid.space, [&p](ivec_t<1> i) { return p.cons[i[0]][0]; });
-        auto energy = lazy(p.grid.space, [&p](ivec_t<1> i) { return p.cons[i[0]][2]; });
+        auto mass = lazy(p.grid.space, [&p](ivec_t<1> i) { return p.truth.cons[i[0]][0]; });
+        auto energy = lazy(p.grid.space, [&p](ivec_t<1> i) { return p.truth.cons[i[0]][2]; });
         auto lorentz = lazy(p.grid.space, [&p](ivec_t<1> idx) {
             auto i = idx[0];
             auto dv = p.grid.cell_volume(i);
-            return lorentz_factor(cons_to_prim(p.cons[i] / dv));
+            return lorentz_factor(cons_to_prim(p.truth.cons[i] / dv));
         });
         total_mass += sum(mass);
         total_energy += sum(energy);
@@ -1392,7 +1420,7 @@ auto get_product(
         for_each(p.grid.space, [&](ivec_t<1> idx) {
             auto i = idx[0];
             auto dv = p.grid.cell_volume(i);
-            p.prim[i] = cons_to_prim(p.cons[i] / dv);
+            p.prim[i] = cons_to_prim(p.truth.cons[i] / dv);
         });
     }
 
