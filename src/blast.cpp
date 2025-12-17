@@ -24,11 +24,8 @@ SOFTWARE.
 
 #include <cassert>
 #include <cmath>
-#include <fstream>
 #include <iostream>
 #include <limits>
-#include <memory>
-#include <numeric>
 #include <optional>
 #include <ranges>
 #include "mist/core.hpp"
@@ -332,12 +329,14 @@ static auto spherical_geometry_source_terms(prim_t p, double r0, double r1) -> c
 // =============================================================================
 
 static auto reldiff(double a, double b) -> double {
-    return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
+    using std::fabs;
+    return fabs(a - b) / (0.5 * (fabs(a) + fabs(b)) + 1e-14);
 }
 
 static auto reldiff(cons_t a, cons_t b) -> double {
-    auto diff = std::fabs(a[0] - b[0]) + std::fabs(a[1] - b[1]) + std::fabs(a[2] - b[2]);
-    auto scale = 0.5 * (std::fabs(a[0]) + std::fabs(b[0]) + std::fabs(a[1]) + std::fabs(b[1]) + std::fabs(a[2]) + std::fabs(b[2])) + 1e-14;
+    using std::fabs;
+    auto diff = fabs(a[0] - b[0]) + fabs(a[1] - b[1]) + fabs(a[2] - b[2]);
+    auto scale = 0.5 * (fabs(a[0]) + fabs(b[0]) + fabs(a[1]) + fabs(b[1]) + fabs(a[2]) + fabs(b[2])) + 1e-14;
     return diff / scale;
 }
 
@@ -726,13 +725,16 @@ struct patch_t {
     mutable double v1 = 0.0;
     mutable edge_type e0 = edge_type::generic;
     mutable edge_type e1 = edge_type::generic;
+    mutable std::optional<cons_t> discontinuity_flux_l;
+    mutable std::optional<cons_t> discontinuity_flux_r;
 
     // Temporary buffers (mutable, recomputed each step)
     mutable cached_t<prim_t, 1> prim;
     mutable cached_t<prim_t, 1> grad;
     mutable cached_t<cons_t, 1> fhat;
-    mutable std::optional<cons_t> discontinuity_flux_l;
-    mutable std::optional<cons_t> discontinuity_flux_r;
+    mutable bool prim_current;
+    mutable bool grad_current;
+    mutable bool fhat_current;
 
     patch_t() = default;
 
@@ -743,7 +745,16 @@ struct patch_t {
         , prim(cache(fill(expand(s, 2), prim_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
         , grad(cache(fill(expand(s, 1), prim_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
         , fhat(cache(fill(index_space(start(s), shape(s) + uvec(1)), cons_t{0.0, 0.0, 0.0}), memory::host, exec::cpu))
+        , prim_current(false)
+        , grad_current(false)
+        , fhat_current(false)
     {
+    }
+
+    void invalidate_mutable_buffers() const {
+        prim_current = false;
+        grad_current = false;
+        fhat_current = false;
     }
 
     // Construct grid on demand from truth and stored edge state
@@ -856,12 +867,16 @@ struct cache_rk_t {
 struct cons_to_prim_t {
     static constexpr const char* name = "cons_to_prim";
     auto value(patch_t p) const -> patch_t {
+        if (p.prim_current) {
+            return p;
+        }
         // Only convert interior cells; guard zones filled by exchange/BC stages
         for_each(p.space, [&](ivec_t<1> idx) {
             auto i = idx[0];
             auto dv = p.grid().cell_volume(i);
             p.prim[i] = cons_to_prim(p.truth.cons[i] / dv);
         });
+        p.prim_current = true;
         return p;
     }
 };
@@ -971,6 +986,9 @@ struct apply_prim_boundary_conditions_t {
 struct compute_gradients_t {
     static constexpr const char* name = "compute_gradients";
     auto value(patch_t p) const -> patch_t {
+        if (p.grad_current) {
+            return p;
+        }
         auto plm_theta = p.plm_theta;
         for_each(space(p.grad), [&](ivec_t<1> idx) {
             auto i = idx[0];
@@ -981,6 +999,7 @@ struct compute_gradients_t {
                 plm_theta
             );
         });
+        p.grad_current = true;
         return p;
     }
 };
@@ -1053,6 +1072,9 @@ struct compute_fluxes_t {
     riemann_solver solver = riemann_solver::hllc;
 
     auto value(patch_t p) const -> patch_t {
+        if (p.fhat_current) {
+            return p;
+        }
         auto i0 = start(p.space)[0];
         auto i1 = upper(p.space)[0];
 
@@ -1092,6 +1114,7 @@ struct compute_fluxes_t {
                     throw std::runtime_error("exact riemann solver not implemented");
             }
         });
+        p.fhat_current = true;
         return p;
     }
 };
@@ -1119,6 +1142,7 @@ struct update_conserved_t {
         p.truth.r1 += p.v1 * dt;
         p.truth.time += dt;
 
+        p.invalidate_mutable_buffers();
         return p;
     }
 };
@@ -1135,6 +1159,7 @@ struct rk_average_t {
         p.truth.time = p.truth_rk.time * (1.0 - alpha) + p.truth.time * alpha;
         p.truth.r0 = p.truth_rk.r0 * (1.0 - alpha) + p.truth.r0 * alpha;
         p.truth.r1 = p.truth_rk.r1 * (1.0 - alpha) + p.truth.r1 * alpha;
+        p.invalidate_mutable_buffers();
         return p;
     }
 };
@@ -1417,11 +1442,14 @@ auto get_product(
 
     // Ensure prim is up-to-date
     for (const auto& p : state.patches) {
-        for_each(p.space, [&](ivec_t<1> idx) {
-            auto i = idx[0];
-            auto dv = p.grid().cell_volume(i);
-            p.prim[i] = cons_to_prim(p.truth.cons[i] / dv);
-        });
+        if (!p.prim_current) {
+            for_each(p.space, [&](ivec_t<1> idx) {
+                auto i = idx[0];
+                auto dv = p.grid().cell_volume(i);
+                p.prim[i] = cons_to_prim(p.truth.cons[i] / dv);
+            });
+            p.prim_current = true;
+        }
     }
 
     auto make_product = [&](auto f) {
