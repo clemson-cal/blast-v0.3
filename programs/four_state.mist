@@ -5,10 +5,15 @@ set initial outer_radius=1.5
 set initial num_zones=2000
 set initial num_partitions=4
 set initial geom=planar
-repeat 0.01 t show iteration
+set initial four_state_ul=+1.0
+set initial four_state_ur=-1.0
+set initial four_state_dl=1.0
+set initial four_state_dr=1.0
+repeat 1 n show iteration
 init
-# t += 0.1
 select products
+write products
+n += 100
 write products
 show profiler
 stop

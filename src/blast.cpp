@@ -570,10 +570,10 @@ struct initial_t {
     double tstart = 0.0;
     initial_condition ic = initial_condition::uniform;
     geometry geom = geometry::spherical;
-    double two_state_dl = 10.0;
-    double two_state_ul = 10.0;
-    double two_state_dr = 1.0;
-    double two_state_ur = 0.0;
+    double four_state_dl = 10.0;
+    double four_state_ul = 10.0;
+    double four_state_dr = 1.0;
+    double four_state_ur = 0.0;
     double cold_temp = 1e-6;
 
     auto fields() const {
@@ -585,10 +585,10 @@ struct initial_t {
             field("tstart", tstart),
             field("ic", ic),
             field("geom", geom),
-            field("two_state_dl", two_state_dl),
-            field("two_state_ul", two_state_ul),
-            field("two_state_dr", two_state_dr),
-            field("two_state_ur", two_state_ur),
+            field("four_state_dl", four_state_dl),
+            field("four_state_ul", four_state_ul),
+            field("four_state_dr", four_state_dr),
+            field("four_state_ur", four_state_ur),
             field("cold_temp", cold_temp)
         );
     }
@@ -602,10 +602,10 @@ struct initial_t {
             field("tstart", tstart),
             field("ic", ic),
             field("geom", geom),
-            field("two_state_dl", two_state_dl),
-            field("two_state_ul", two_state_ul),
-            field("two_state_dr", two_state_dr),
-            field("two_state_ur", two_state_ur),
+            field("four_state_dl", four_state_dl),
+            field("four_state_ul", four_state_ul),
+            field("four_state_dr", four_state_dr),
+            field("four_state_ur", four_state_ur),
             field("cold_temp", cold_temp)
         );
     }
@@ -649,10 +649,10 @@ static auto external_hydrodynamics(const initial_t& ini, double r, double t) -> 
         case initial_condition::uniform:
             return prim_t{1.0, 0.0, 1.0};
         case initial_condition::four_state: {
-            auto dl = ini.two_state_dl;
-            auto ul = ini.two_state_ul;
-            auto dr = ini.two_state_dr;
-            auto ur = ini.two_state_ur;
+            auto dl = ini.four_state_dl;
+            auto ul = ini.four_state_ul;
+            auto dr = ini.four_state_dr;
+            auto ur = ini.four_state_ur;
 
             // Solve two-shock Riemann problem
             auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
@@ -780,7 +780,7 @@ struct initial_state_t {
             // For four_state, align patch edges with discontinuities
             auto edges = four_state_discontinuities(
                 ini.inner_radius, ini.outer_radius, ini.tstart,
-                ini.two_state_dl, ini.two_state_ul, ini.two_state_dr, ini.two_state_ur);
+                ini.four_state_dl, ini.four_state_ul, ini.four_state_dr, ini.four_state_ur);
             unsigned zones_per_patch = ini.num_zones / 4;
             unsigned patch_idx = i0 / zones_per_patch;
 
