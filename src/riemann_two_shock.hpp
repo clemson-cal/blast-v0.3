@@ -21,9 +21,10 @@ Output: u, p (common four-velocity and pressure in contact region)
 
 #pragma once
 
+#include <array>
 #include <cmath>
-#include <stdexcept>
 #include <optional>
+#include <stdexcept>
 
 namespace riemann {
 
@@ -282,17 +283,17 @@ inline auto try_solve_two_shock(
 }
 
 /**
- * Compute shock velocities given the solution
+ * Compute discontinuity velocities given the solution
  *
  * @param input     The input state
  * @param solution  The two-shock solution
- * @return          Pair of (reverse shock velocity, forward shock velocity)
+ * @return          Vector of (reverse shock velocity, contact velocity, forward shock velocity)
  *                  as coordinate velocities (beta = v/c)
  */
-inline auto compute_shock_velocities(
+inline auto compute_discontinuity_velocities(
     const two_shock_input_t& input,
     const two_shock_solution_t& solution
-) -> std::pair<double, double> {
+) -> std::array<double, 3> {
     // Map input to standard region labeling
     double d1 = input.dr;
     double u1 = input.ur;
@@ -304,21 +305,22 @@ inline auto compute_shock_velocities(
     double g4 = std::sqrt(1.0 + u4 * u4);
     double beta4 = u4 / g4;
 
+    // Contact velocity from common four-velocity
     double g = std::sqrt(1.0 + solution.u * solution.u);
-    double beta = solution.u / g;
+    double v_cd = solution.u / g;
 
     // Shock velocity from mass flux conservation:
     // rho1 * gamma1 * (v1 - vs) = rho2 * gamma * (v - vs)
     // Solving for vs:
     double d1_g1 = d1 * g1;
     double d2_g = solution.d2 * g;
-    double v_fs = (d2_g * beta - d1_g1 * beta1) / (d2_g - d1_g1);
+    double v_fs = (d2_g * v_cd - d1_g1 * beta1) / (d2_g - d1_g1);
 
     double d4_g4 = d4 * g4;
     double d3_g = solution.d3 * g;
-    double v_rs = (d3_g * beta - d4_g4 * beta4) / (d3_g - d4_g4);
+    double v_rs = (d3_g * v_cd - d4_g4 * beta4) / (d3_g - d4_g4);
 
-    return {v_rs, v_fs};
+    return {v_rs, v_cd, v_fs};
 }
 
 } // namespace riemann

@@ -521,17 +521,66 @@ auto from_string(std::type_identity<initial_condition>, const std::string& s) ->
     throw std::runtime_error("unknown initial condition: " + s);
 }
 
-// Returns the 5 edge positions for four_state: [domain_r0, r_rs, r_cd, r_fs, domain_r1]
-static auto four_state_edges(double domain_r0, double domain_r1, double tstart) -> std::array<double, 5> {
-    constexpr double dl = 10.0;
-    constexpr double ul = 10.0;
-    constexpr double dr = 1.0;
-    constexpr double ur = 0.0;
+// =============================================================================
+// Initial configuration (defined early so initial_primitive can use it)
+// =============================================================================
 
+struct initial_t {
+    unsigned int num_zones = 400;
+    unsigned int num_partitions = 1;
+    double inner_radius = 0.0;
+    double outer_radius = 1.0;
+    double tstart = 0.0;
+    initial_condition ic = initial_condition::uniform;
+    geometry geom = geometry::spherical;
+    double two_state_dl = 10.0;
+    double two_state_ul = 10.0;
+    double two_state_dr = 1.0;
+    double two_state_ur = 0.0;
+    double cold_temp = 1e-6;
+
+    auto fields() const {
+        return std::make_tuple(
+            field("num_zones", num_zones),
+            field("num_partitions", num_partitions),
+            field("inner_radius", inner_radius),
+            field("outer_radius", outer_radius),
+            field("tstart", tstart),
+            field("ic", ic),
+            field("geom", geom),
+            field("two_state_dl", two_state_dl),
+            field("two_state_ul", two_state_ul),
+            field("two_state_dr", two_state_dr),
+            field("two_state_ur", two_state_ur),
+            field("cold_temp", cold_temp)
+        );
+    }
+
+    auto fields() {
+        return std::make_tuple(
+            field("num_zones", num_zones),
+            field("num_partitions", num_partitions),
+            field("inner_radius", inner_radius),
+            field("outer_radius", outer_radius),
+            field("tstart", tstart),
+            field("ic", ic),
+            field("geom", geom),
+            field("two_state_dl", two_state_dl),
+            field("two_state_ul", two_state_ul),
+            field("two_state_dr", two_state_dr),
+            field("two_state_ur", two_state_ur),
+            field("cold_temp", cold_temp)
+        );
+    }
+};
+
+// Returns the 5 edge positions for four_state: [domain_r0, r_rs, r_cd, r_fs, domain_r1]
+static auto four_state_discontinuities(
+    double domain_r0, double domain_r1, double tstart,
+    double dl, double ul, double dr, double ur
+) -> std::array<double, 5> {
     auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
-    auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
-    double g_cd = std::sqrt(1.0 + sol.u * sol.u);
-    double v_cd = sol.u / g_cd;
+    auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
 
     double r_rs = 1.0 + v_rs * tstart;
     double r_cd = 1.0 + v_cd * tstart;
@@ -540,8 +589,8 @@ static auto four_state_edges(double domain_r0, double domain_r1, double tstart) 
     return {domain_r0, r_rs, r_cd, r_fs, domain_r1};
 }
 
-static auto initial_primitive(initial_condition ic, double r, double tstart = 0.0) -> prim_t {
-    switch (ic) {
+static auto initial_primitive(const initial_t& ini, double r) -> prim_t {
+    switch (ini.ic) {
         case initial_condition::sod:
             if (r < 1.0) {
                 return prim_t{1.0, 0.0, 1.0};
@@ -563,30 +612,26 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
         case initial_condition::uniform:
             return prim_t{1.0, 0.0, 1.0};
         case initial_condition::four_state: {
-            // Converging cold flow: left moves right, right moves left
-            constexpr double dl = 10.0;
-            constexpr double ul = 10.0;   // four-velocity, moving right
-            constexpr double dr = 1.0;
-            constexpr double ur = 0.0;  // four-velocity, moving left
-            constexpr double cold_temp = 1e-6;
+            auto dl = ini.two_state_dl;
+            auto ul = ini.two_state_ul;
+            auto dr = ini.two_state_dr;
+            auto ur = ini.two_state_ur;
 
             // Solve two-shock Riemann problem
             auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
 
-            // Compute shock and contact velocities
-            auto [v_rs, v_fs] = riemann::compute_shock_velocities({dl, ul, dr, ur}, sol);
-            double g_cd = std::sqrt(1.0 + sol.u * sol.u);
-            double v_cd = sol.u / g_cd;
+            // Compute discontinuity velocities
+            auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
 
             // Positions at tstart (shocks launched from r=1.0)
-            double r_rs = 1.0 + v_rs * tstart;  // reverse shock position
-            double r_cd = 1.0 + v_cd * tstart;  // contact position
-            double r_fs = 1.0 + v_fs * tstart;  // forward shock position
+            double r_rs = 1.0 + v_rs * ini.tstart;
+            double r_cd = 1.0 + v_cd * ini.tstart;
+            double r_fs = 1.0 + v_fs * ini.tstart;
 
             // Determine which region r falls into
             if (r < r_rs) {
                 // Region 4: original left state
-                return prim_t{dl, ul, cold_temp * dl};
+                return prim_t{dl, ul, ini.cold_temp * dl};
             } else if (r < r_cd) {
                 // Region 3: shocked left material
                 return prim_t{sol.d3, sol.u, sol.p};
@@ -595,7 +640,7 @@ static auto initial_primitive(initial_condition ic, double r, double tstart = 0.
                 return prim_t{sol.d2, sol.u, sol.p};
             } else {
                 // Region 1: original right state
-                return prim_t{dr, ur, cold_temp * dr};
+                return prim_t{dr, ur, ini.cold_temp * dr};
             }
         }
         case initial_condition::mignone_bodo:
@@ -672,22 +717,19 @@ struct patch_t {
 
 struct initial_state_t {
     static constexpr const char* name = "initial_state";
-    double domain_r0;      // global domain inner radius
-    double domain_r1;      // global domain outer radius
-    unsigned num_zones;    // global number of zones
-    geometry geom;
-    initial_condition ic;
-    double tstart;
+    initial_t ini;
 
     auto value(patch_t p) const -> patch_t {
         // Compute this patch's edge positions from its index space
         auto i0 = start(p.grid.space)[0];
         auto i1 = upper(p.grid.space)[0];
 
-        if (ic == initial_condition::four_state) {
+        if (ini.ic == initial_condition::four_state) {
             // For four_state, align patch edges with discontinuities
-            auto edges = four_state_edges(domain_r0, domain_r1, tstart);
-            unsigned zones_per_patch = num_zones / 4;
+            auto edges = four_state_discontinuities(
+                ini.inner_radius, ini.outer_radius, ini.tstart,
+                ini.two_state_dl, ini.two_state_ul, ini.two_state_dr, ini.two_state_ur);
+            unsigned zones_per_patch = ini.num_zones / 4;
             unsigned patch_idx = i0 / zones_per_patch;
 
             p.grid.r0 = edges[patch_idx];
@@ -710,25 +752,25 @@ struct initial_state_t {
                                     p.grid.e1 == edge_type::contact ? "contact" : "generic")
                       << "\n";
         } else {
-            double alpha0 = double(i0) / num_zones;
-            double alpha1 = double(i1) / num_zones;
-            p.grid.r0 = domain_r0 + alpha0 * (domain_r1 - domain_r0);
-            p.grid.r1 = domain_r0 + alpha1 * (domain_r1 - domain_r0);
+            double alpha0 = double(i0) / ini.num_zones;
+            double alpha1 = double(i1) / ini.num_zones;
+            p.grid.r0 = ini.inner_radius + alpha0 * (ini.outer_radius - ini.inner_radius);
+            p.grid.r1 = ini.inner_radius + alpha1 * (ini.outer_radius - ini.inner_radius);
             p.grid.e0 = edge_type::generic;
             p.grid.e1 = edge_type::generic;
         }
 
         p.grid.v0 = 0.0;
         p.grid.v1 = 0.0;
-        p.grid.geom = geom;
-        p.time = tstart;
+        p.grid.geom = ini.geom;
+        p.time = ini.tstart;
 
         // Initialize conserved variables
         for_each(p.grid.space, [&](ivec_t<1> idx) {
             auto i = idx[0];
             auto rc = p.grid.cell_radius(i);
             auto dv = p.grid.cell_volume(i);
-            auto prim = initial_primitive(ic, rc, tstart);
+            auto prim = initial_primitive(ini, rc);
             auto cons = prim_to_cons(prim);
             p.cons[i] = cons * dv;
         });
@@ -827,9 +869,7 @@ struct apply_cons_boundary_conditions_t {
     static constexpr const char* name = "apply_bc";
     boundary_condition bc_lo;
     boundary_condition bc_hi;
-    initial_condition ic;
-    unsigned num_zones;  // global domain size
-    double tstart;
+    initial_t ini;
 
     auto value(patch_t p) const -> patch_t {
         auto i0 = start(p.grid.space)[0];
@@ -848,7 +888,7 @@ struct apply_cons_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i0 - 1 - g;
                         auto r = p.grid.cell_radius(i);
-                        auto prim = initial_primitive(ic, r, tstart);
+                        auto prim = initial_primitive(ini, r);
                         p.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
                     }
                     break;
@@ -863,7 +903,7 @@ struct apply_cons_boundary_conditions_t {
         }
 
         // Right boundary (patch ends at global extent)
-        if (static_cast<unsigned>(i1) == num_zones - 1) {
+        if (static_cast<unsigned>(i1) == ini.num_zones - 1) {
             switch (bc_hi) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
@@ -875,7 +915,7 @@ struct apply_cons_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i1 + 1 + g;
                         auto r = p.grid.cell_radius(i);
-                        auto prim = initial_primitive(ic, r, tstart);
+                        auto prim = initial_primitive(ini, r);
                         p.cons[i] = prim_to_cons(prim) * p.grid.cell_volume(i);
                     }
                     break;
@@ -1111,39 +1151,7 @@ struct blast {
         }
     };
 
-    struct initial_t {
-        unsigned int num_zones = 400;
-        unsigned int num_partitions = 1;
-        double inner_radius = 0.0;
-        double outer_radius = 1.0;
-        double tstart = 0.0;
-        initial_condition ic = initial_condition::uniform;
-        geometry geom = geometry::spherical;
-
-        auto fields() const {
-            return std::make_tuple(
-                field("num_zones", num_zones),
-                field("num_partitions", num_partitions),
-                field("inner_radius", inner_radius),
-                field("outer_radius", outer_radius),
-                field("tstart", tstart),
-                field("ic", ic),
-                field("geom", geom)
-            );
-        }
-
-        auto fields() {
-            return std::make_tuple(
-                field("num_zones", num_zones),
-                field("num_partitions", num_partitions),
-                field("inner_radius", inner_radius),
-                field("outer_radius", outer_radius),
-                field("tstart", tstart),
-                field("ic", ic),
-                field("geom", geom)
-            );
-        }
-    };
+    using initial_t = ::initial_t;
 
     struct state_t {
         std::vector<patch_t> patches;
@@ -1215,14 +1223,7 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
         return patch_t(subspace(S, np, p, 0));
     }));
 
-    ctx.execute(patches, initial_state_t{
-        ini.inner_radius,
-        ini.outer_radius,
-        ini.num_zones,
-        ini.geom,
-        ini.ic,
-        ini.tstart
-    });
+    ctx.execute(patches, initial_state_t{ini});
 
     return {std::move(patches), ini.tstart};
 }
@@ -1240,7 +1241,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
 
     auto euler_step = parallel::pipeline(
         exchange_cons_guard_t{},
-        apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini.ic, ini.num_zones, ini.tstart},
+        apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini},
         cons_to_prim_t{},
         compute_gradients_t{},
         classify_patch_edges_t{cfg.tol_rho, cfg.tol_u},
