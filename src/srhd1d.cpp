@@ -775,16 +775,15 @@ auto get_time(const srhd1d::state_t& state, const std::string& name) -> double {
 }
 
 auto get_timeseries(
-    const srhd1d::config_t& cfg,
-    const srhd1d::initial_t& ini,
     const srhd1d::state_t& state,
-    const std::string& name
+    const std::string& name,
+    const srhd1d::exec_context_t& ctx
 ) -> double {
     if (name == "time") {
         return state.time;
     }
 
-    auto dx = ini.domain_length / ini.num_zones;
+    auto dx = ctx.initial.domain_length / ctx.initial.num_zones;
     auto total_mass = 0.0;
     auto total_energy = 0.0;
     auto max_lorentz = 1.0;

@@ -515,8 +515,6 @@ struct grid_t {
     double v0 = 0.0;              // left edge velocity
     double v1 = 0.0;              // right edge velocity
     index_space_t<1> space;       // index space for this grid
-    edge_type e0 = edge_type::generic;  // left edge type
-    edge_type e1 = edge_type::generic;  // right edge type
     geometry geom = geometry::spherical;
 
     auto num_zones() const -> unsigned {
@@ -750,7 +748,7 @@ struct patch_t {
 
     // Construct grid on demand from truth and stored edge state
     auto grid() const -> grid_t {
-        return {truth.r0, truth.r1, v0, v1, space, e0, e1, geom};
+        return {truth.r0, truth.r1, v0, v1, space, geom};
     }
 };
 
@@ -1183,8 +1181,8 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
-        double shock_tol = 1e-6;    // shock jump condition tolerance
-        double contact_tol = 1e-6;  // contact jump condition tolerance
+        double shock_tol = 0.0;
+        double contact_tol = 0.0;
 
         auto fields() const {
             return std::make_tuple(
@@ -1377,10 +1375,9 @@ auto get_time(const blast::state_t& state, const std::string& name) -> double {
 }
 
 auto get_timeseries(
-    const blast::config_t& cfg,
-    const blast::initial_t& ini,
     const blast::state_t& state,
-    const std::string& name
+    const std::string& name,
+    const blast::exec_context_t& ctx
 ) -> double {
     if (name == "time") {
         return state.time;
