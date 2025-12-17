@@ -29,6 +29,7 @@ SOFTWARE.
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <ranges>
 #include "mist/core.hpp"
 #include "mist/driver/physics_impl.hpp"
@@ -325,14 +326,10 @@ static auto reldiff(double a, double b) -> double {
     return std::fabs(a - b) / (0.5 * (std::fabs(a) + std::fabs(b)) + 1e-14);
 }
 
-// New spec: Step 1 - check density continuity
-static auto has_density_jump(prim_t pL, prim_t pR, double tol_rho) -> bool {
-    return reldiff(pL[0], pR[0]) >= tol_rho;
-}
-
-// New spec: Step 2 - check four-velocity continuity (given density is discontinuous)
-static auto has_velocity_jump(prim_t pL, prim_t pR, double tol_u) -> bool {
-    return reldiff(pL[1], pR[1]) > tol_u;
+static auto reldiff(cons_t a, cons_t b) -> double {
+    auto diff = std::fabs(a[0] - b[0]) + std::fabs(a[1] - b[1]) + std::fabs(a[2] - b[2]);
+    auto scale = 0.5 * (std::fabs(a[0]) + std::fabs(b[0]) + std::fabs(a[1]) + std::fabs(b[1]) + std::fabs(a[2]) + std::fabs(b[2])) + 1e-14;
+    return diff / scale;
 }
 
 // Compute shock velocity using relativistic jump relations
@@ -370,6 +367,29 @@ static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
 
     // Boost shock velocity to lab frame using relativistic velocity addition
     return (vu + beta_shock) / (1.0 + vu * beta_shock);
+}
+
+// Check if states satisfy shock jump conditions (Rankine-Hugoniot)
+// Returns true if F_L - v_s * U_L ≈ F_R - v_s * U_R
+static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool {
+    auto v_s = compute_shock_velocity(pL, pR);
+    auto uL = prim_to_cons(pL);
+    auto uR = prim_to_cons(pR);
+    auto fL = prim_and_cons_to_flux(pL, uL);
+    auto fR = prim_and_cons_to_flux(pR, uR);
+    auto flux_L = fL - uL * v_s;
+    auto flux_R = fR - uR * v_s;
+    return reldiff(flux_L, flux_R) < shock_tol;
+}
+
+// Check if states satisfy contact discontinuity conditions
+// Returns true if v_L ≈ v_R and p_L ≈ p_R
+static auto satisfies_contact_jump(prim_t pL, prim_t pR, double contact_tol) -> bool {
+    auto vL = beta(pL);
+    auto vR = beta(pR);
+    auto pL_pressure = pL[2];
+    auto pR_pressure = pR[2];
+    return reldiff(vL, vR) < contact_tol && reldiff(pL_pressure, pR_pressure) < contact_tol;
 }
 
 // =============================================================================
@@ -697,6 +717,8 @@ struct patch_t {
     mutable cached_t<prim_t, 1> prim;     // primitive variables at cell centers
     cached_t<prim_t, 1> grad;             // PLM gradients at cell centers
     cached_t<cons_t, 1> fhat;             // Godunov fluxes at faces
+    std::optional<cons_t> discontinuity_flux_l;  // flux density at left edge (if discontinuity)
+    std::optional<cons_t> discontinuity_flux_r;  // flux density at right edge (if discontinuity)
 
     patch_t() = default;
 
@@ -951,37 +973,30 @@ struct compute_gradients_t {
 
 struct classify_patch_edges_t {
     static constexpr const char* name = "classify_edges";
-    double tol_rho;  // tolerance for density continuity check
-    double tol_u;    // tolerance for four-velocity continuity check
+    double shock_tol;    // tolerance for shock jump condition check
+    double contact_tol;  // tolerance for contact jump condition check
 
     // Classify a single edge and return (type, velocity)
     auto classify_edge(prim_t pL, prim_t pR) const -> std::pair<edge_type, double> {
-        edge_type et = edge_type::generic;
-        double v = 0.0;
-
-        // Step 1: Check if density is discontinuous
-        if (!has_density_jump(pL, pR, tol_rho)) {
-            // Density is continuous → neither shock nor contact
-            et = edge_type::generic;
-            v = 0.5 * (beta(pL) + beta(pR));
+        // Step 1: Check if states satisfy shock jump conditions
+        if (satisfies_shock_jump(pL, pR, shock_tol)) {
+            return {edge_type::shock, compute_shock_velocity(pL, pR)};
         }
-        // Step 2: Check if four-velocity is discontinuous (given density is discontinuous)
-        else if (has_velocity_jump(pL, pR, tol_u)) {
-            // Four-velocity is discontinuous → shock
-            et = edge_type::shock;
-            v = compute_shock_velocity(pL, pR);
+        // Step 2: Check if states satisfy contact jump conditions
+        if (satisfies_contact_jump(pL, pR, contact_tol)) {
+            return {edge_type::contact, 0.5 * (beta(pL) + beta(pR))};
         }
-        else {
-            // Four-velocity is continuous → contact
-            et = edge_type::contact;
-            v = 0.5 * (beta(pL) + beta(pR));
-        }
-        return {et, v};
+        // Step 3: Otherwise generic
+        return {edge_type::generic, 0.5 * (beta(pL) + beta(pR))};
     }
 
     auto value(patch_t p) const -> patch_t {
         auto i0 = start(p.grid.space)[0];
         auto i1 = upper(p.grid.space)[0];
+
+        // Reset discontinuity fluxes
+        p.discontinuity_flux_l.reset();
+        p.discontinuity_flux_r.reset();
 
         // Classify left edge (face i0)
         {
@@ -990,6 +1005,13 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.grid.e0 = et;
             p.grid.v0 = vel;
+
+            // Compute flux at discontinuity using interior state (pR)
+            if (et != edge_type::generic) {
+                auto uR = prim_to_cons(pR);
+                auto fR = prim_and_cons_to_flux(pR, uR);
+                p.discontinuity_flux_l = fR - uR * vel;
+            }
         }
 
         // Classify right edge (face i1)
@@ -999,6 +1021,13 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.grid.e1 = et;
             p.grid.v1 = vel;
+
+            // Compute flux at discontinuity using interior state (pL)
+            if (et != edge_type::generic) {
+                auto uL = prim_to_cons(pL);
+                auto fL = prim_and_cons_to_flux(pL, uL);
+                p.discontinuity_flux_r = fL - uL * vel;
+            }
         }
 
         return p;
@@ -1010,11 +1039,26 @@ struct compute_fluxes_t {
     riemann_solver solver = riemann_solver::hllc;
 
     auto value(patch_t p) const -> patch_t {
+        auto i0 = start(p.grid.space)[0];
+        auto i1 = upper(p.grid.space)[0];
+
         for_each(space(p.fhat), [&](ivec_t<1> idx) {
             int f = idx[0];
+            auto da = p.grid.face_area(f);
+
+            // Override flux at left boundary if it's a discontinuity
+            if (f == i0 && p.discontinuity_flux_l) {
+                p.fhat[f] = *p.discontinuity_flux_l * da;
+                return;
+            }
+
+            // Override flux at right boundary if it's a discontinuity
+            if (f == i1 && p.discontinuity_flux_r) {
+                p.fhat[f] = *p.discontinuity_flux_r * da;
+                return;
+            }
 
             // Riemann solve with PLM reconstruction
-            auto da = p.grid.face_area(f);
             auto vf = p.grid.face_velocity(f);
             auto pl = p.prim[f - 1] + p.grad[f - 1] * 0.5;
             auto pr = p.prim[f + 0] - p.grad[f + 0] * 0.5;
@@ -1121,8 +1165,8 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
-        double tol_rho = 0.1;   // density discontinuity tolerance
-        double tol_u = 1e-3;    // four-velocity discontinuity tolerance
+        double shock_tol = 0.1;    // shock jump condition tolerance
+        double contact_tol = 0.1;  // contact jump condition tolerance
 
         auto fields() const {
             return std::make_tuple(
@@ -1132,8 +1176,8 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("tol_rho", tol_rho),
-                field("tol_u", tol_u)
+                field("shock_tol", shock_tol),
+                field("contact_tol", contact_tol)
             );
         }
 
@@ -1145,8 +1189,8 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("tol_rho", tol_rho),
-                field("tol_u", tol_u)
+                field("shock_tol", shock_tol),
+                field("contact_tol", contact_tol)
             );
         }
     };
@@ -1199,7 +1243,7 @@ struct blast {
 // =============================================================================
 
 auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
-    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .tol_rho = 0.1, .tol_u = 1e-3};
+    return {.rk_order = 1, .cfl = 0.4, .plm_theta = 1.5, .bc_lo = boundary_condition::outflow, .bc_hi = boundary_condition::outflow, .riemann = riemann_solver::hllc, .shock_tol = 0.1, .contact_tol = 0.1};
 }
 
 auto default_initial_config(std::type_identity<blast>) -> blast::initial_t {
@@ -1244,7 +1288,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         apply_cons_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini},
         cons_to_prim_t{},
         compute_gradients_t{},
-        classify_patch_edges_t{cfg.tol_rho, cfg.tol_u},
+        classify_patch_edges_t{cfg.shock_tol, cfg.contact_tol},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );

@@ -60,12 +60,16 @@ All checks use tolerance parameters for numerical robustness.
 
 ### Classification Algorithm
 
-**Step 1: Check density continuity**
-- If `reldiff(ρL, ρR) < tol_rho`: density is continuous → **neither shock nor contact** (edge_type = 0)
+**Step 1: Check shock jump conditions (Rankine-Hugoniot)**
+- Compute shock velocity `v_s` from the states using relativistic jump relations
+- Compute flux in shock frame on both sides: `flux_L = F_L - v_s * U_L`, `flux_R = F_R - v_s * U_R`
+- If `reldiff(flux_L, flux_R) < shock_tol`: states satisfy shock conditions → **shock** (edge_type = 2)
 
-**Step 2: Check four-velocity continuity** (given density is discontinuous)
-- If `reldiff(uL, uR) > tol_u`: four-velocity is discontinuous → **shock** (edge_type = 2)
-- If `reldiff(uL, uR) < tol_u`: four-velocity is continuous → **contact** (edge_type = 1)
+**Step 2: Check contact jump conditions**
+- If `reldiff(v_L, v_R) < contact_tol` AND `reldiff(p_L, p_R) < contact_tol`: velocity and pressure are continuous → **contact** (edge_type = 1)
+
+**Step 3: Otherwise**
+- Neither shock nor contact conditions satisfied → **generic** (edge_type = 0)
 
 ### Edge Velocity Computation
 
