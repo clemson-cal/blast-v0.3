@@ -9,10 +9,10 @@ set initial four_state_ul=+1.0
 set initial four_state_ur=-1.0
 set initial four_state_dl=1.0
 set initial four_state_dr=1.0
-repeat 1 n show iteration
 init
 select products
 write products
+repeat 1 n show iteration
 n += 100
 write products
 show profiler

@@ -638,6 +638,9 @@ static auto initial_patch_edges(const initial_t& ini) -> std::vector<double> {
             if (np < 2 || np % 2 != 0) {
                 throw std::runtime_error("four_state requires even number of patches >= 2");
             }
+            if (ini.tstart <= 0.0) {
+                throw std::runtime_error("four_state requires tstart > 0");
+            }
             auto [r_rs, r_cd, r_fs] = four_state_discontinuities(ini);
             auto half = np / 2;
 
