@@ -340,41 +340,25 @@ static auto reldiff(cons_t a, cons_t b) -> double {
     return diff / scale;
 }
 
-// Compute shock velocity using relativistic jump relations
+// Compute shock velocity using mass flux conservation
+// v_s = (ρ_R γ_R β_R - ρ_L γ_L β_L) / (ρ_R γ_R - ρ_L γ_L)
 static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
     using std::sqrt;
-    using std::pow;
-    constexpr double gh = gamma_law_index;  // 4/3 (g-hat as in Blandford-McKee notation)
 
-    double uu, ud;
-    double dir;
+    double rho_L = pL[0];
+    double u_L = pL[1];
+    double gamma_L = sqrt(1.0 + u_L * u_L);
+    double beta_L = u_L / gamma_L;
 
-    if (pL[2] > pR[2]) {
-        // Left is downstream (shocked), right is upstream (unshocked)
-        ud = pL[1];
-        uu = pR[1];
-        dir = +1.0;  // shock propagates left to right
-    } else {
-        // Right is downstream (shocked), left is upstream (unshocked)
-        ud = pR[1];
-        uu = pL[1];
-        dir = -1.0;  // shock propagates right to left
-    }
+    double rho_R = pR[0];
+    double u_R = pR[1];
+    double gamma_R = sqrt(1.0 + u_R * u_R);
+    double beta_R = u_R / gamma_R;
 
-    // Relative Lorentz factor
-    double gl = sqrt(1.0 + uu * uu) * sqrt(1.0 + ud * ud) - uu * ud;
+    double rho_gamma_L = rho_L * gamma_L;
+    double rho_gamma_R = rho_R * gamma_R;
 
-    // Shock Lorentz factor (in upstream rest frame)
-    double gs = sqrt((gl + 1.0) * pow(gh * (gl - 1.0) + 1.0, 2.0) / (gh * (2.0 - gh) * (gl - 1.0) + 2.0));
-
-    // Shock velocity in upstream rest frame
-    double vs = dir * sqrt(1.0 - 1.0 / (gs * gs));
-
-    // Upstream velocity in lab frame
-    double vu = uu / sqrt(1.0 + uu * uu);
-
-    // Boost shock velocity to lab frame using relativistic velocity addition
-    return (vu + vs) / (1.0 + vu * vs);
+    return (rho_gamma_R * beta_R - rho_gamma_L * beta_L) / (rho_gamma_R - rho_gamma_L);
 }
 
 // Check if states satisfy shock jump conditions (Rankine-Hugoniot)

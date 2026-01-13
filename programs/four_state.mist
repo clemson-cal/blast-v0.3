@@ -1,19 +1,23 @@
 set initial model=four_state
-set initial tstart=0.5
+set initial tstart=0.1
 set initial inner_radius=0.5
 set initial outer_radius=1.5
-set initial num_zones=2000
-set initial num_patches=4
-set initial geom=planar
-set initial four_state_ul=+1.0
-set initial four_state_ur=-1.0
-set initial four_state_dl=1.0
+set initial num_zones=200
+set initial num_patches=2
+set initial geom=spherical
+set initial four_state_ul=+10.0
+set initial four_state_ur=0.0
+set initial four_state_dl=10.0
 set initial four_state_dr=1.0
+set physics riemann=hllc
+set physics bc_lo=inflow
+set physics bc_hi=inflow
 init
 select products
 write products
 repeat 1 n show iteration
-n += 100
+# n += 100
+t -> 0.4
 write products
 show profiler
 stop
