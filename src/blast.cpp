@@ -678,7 +678,7 @@ static auto initial_patch_edges(const initial_t& ini) -> std::vector<double> {
     return edges;
 }
 
-static auto external_hydrodynamics(const initial_t& ini, double r, double t) -> prim_t {
+static auto initial_hydrodynamics(const initial_t& ini, double r, double t) -> prim_t {
     switch (ini.model) {
         case external_model::sod:
             if (r < 1.0) {
@@ -740,6 +740,35 @@ static auto external_hydrodynamics(const initial_t& ini, double r, double t) -> 
             }
     }
     assert(false);
+}
+
+// External hydrodynamics for boundary conditions only
+// Returns the upstream (unshocked) state appropriate for each boundary
+static auto external_hydrodynamics(
+    const initial_t& ini,
+    double r,
+    geometry geom,
+    bool is_left_boundary
+) -> prim_t {
+    switch (ini.model) {
+        case external_model::four_state: {
+            if (is_left_boundary) {
+                // Region 4: unshocked ejecta with 1/r² density profile in spherical
+                auto dl = ini.four_state_dl;
+                auto ul = ini.four_state_ul;
+                double rho = (geom == geometry::spherical) ? dl / (r * r) : dl;
+                return prim_t{rho, ul, ini.cold_temp * rho};
+            } else {
+                // Region 1: unshocked ambient (uniform density)
+                auto dr = ini.four_state_dr;
+                auto ur = ini.four_state_ur;
+                return prim_t{dr, ur, ini.cold_temp * dr};
+            }
+        }
+        default:
+            // For other models, fall back to initial state at t=0
+            return initial_hydrodynamics(ini, r, 0.0);
+    }
 }
 
 // Source of truth for serialization and RK averaging
@@ -859,7 +888,7 @@ struct initial_state_t {
             auto i = idx[0];
             auto rc = p.grid().cell_radius(i);
             auto dv = p.grid().cell_volume(i);
-            auto prim = external_hydrodynamics(ini, rc, ini.tstart);
+            auto prim = initial_hydrodynamics(ini, rc, ini.tstart);
             auto cons = prim_to_cons(prim);
             p.truth.cons[i] = cons * dv;
         });
@@ -981,7 +1010,7 @@ struct apply_prim_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i0 - 1 - g;
                         auto r = p.grid().cell_radius(i);
-                        p.prim[i] = external_hydrodynamics(ini, r, p.truth.time);
+                        p.prim[i] = external_hydrodynamics(ini, r, p.geom, true);
                     }
                     break;
                 case boundary_condition::reflecting:
@@ -1005,7 +1034,7 @@ struct apply_prim_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i1 + 1 + g;
                         auto r = p.grid().cell_radius(i);
-                        p.prim[i] = external_hydrodynamics(ini, r, p.truth.time);
+                        p.prim[i] = external_hydrodynamics(ini, r, p.geom, false);
                     }
                     break;
                 case boundary_condition::reflecting:
