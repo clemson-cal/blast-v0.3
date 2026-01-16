@@ -371,6 +371,8 @@ static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool
     auto fR = prim_and_cons_to_flux(pR, uR);
     auto flux_L = fL - uL * v_s;
     auto flux_R = fR - uR * v_s;
+    // printf("reldiff: %f \n", reldiff(flux_L, flux_R));
+    // printf("%f, %f, %f    %f, %f, %f \n", pL[0], pL[1], pL[2], pR[0], pR[1], pR[2]);
     return reldiff(flux_L, flux_R) < shock_tol;
 }
 
@@ -602,14 +604,9 @@ static auto four_state_discontinuities(const initial_t& ini) -> std::array<doubl
     auto dr = ini.four_state_dr;
     auto ur = ini.four_state_ur;
 
-    auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
-    auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
+    auto result = riemann::evolve_two_shock({dl, ul, dr, ur}, ini.tstart);
 
-    double r_rs = 1.0 + v_rs * ini.tstart;
-    double r_cd = 1.0 + v_cd * ini.tstart;
-    double r_fs = 1.0 + v_fs * ini.tstart;
-
-    return {r_rs, r_cd, r_fs};
+    return {result.r_rs, result.r_cd, result.r_fs};
 }
 
 // Returns patch edge positions based on initial condition
@@ -662,7 +659,7 @@ static auto initial_patch_edges(const initial_t& ini) -> std::vector<double> {
     return edges;
 }
 
-static auto initial_hydrodynamics(const initial_t& ini, double r, double t) -> prim_t {
+static auto initial_hydrodynamics(const initial_t& ini, double r, geometry geom, double t) -> prim_t {
     switch (ini.model) {
         case external_model::sod:
             if (r < 1.0) {
@@ -690,21 +687,19 @@ static auto initial_hydrodynamics(const initial_t& ini, double r, double t) -> p
             auto dr = ini.four_state_dr;
             auto ur = ini.four_state_ur;
 
-            // Solve two-shock Riemann problem
-            auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
+            // Evolve the two-shock system to time t
+            auto result = riemann::evolve_two_shock({dl, ul, dr, ur}, t);
 
-            // Compute discontinuity velocities
-            auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
-
-            // Positions at time t (shocks launched from r=1.0)
-            double r_rs = 1.0 + v_rs * t;
-            double r_cd = 1.0 + v_cd * t;
-            double r_fs = 1.0 + v_fs * t;
+            double r_rs = result.r_rs;
+            double r_cd = result.r_cd;
+            double r_fs = result.r_fs;
+            auto& sol = result.solution;
 
             // Determine which region r falls into
             if (r < r_rs) {
                 // Region 4: original left state
-                return prim_t{dl, ul, ini.cold_temp * dl};
+                double rho = (geom == geometry::spherical) ? dl / (r * r) : dl;
+                return prim_t{rho, ul, ini.cold_temp * rho};
             } else if (r < r_cd) {
                 // Region 3: shocked left material
                 return prim_t{sol.d3, sol.u, sol.p};
@@ -751,7 +746,7 @@ static auto external_hydrodynamics(
         }
         default:
             // For other models, fall back to initial state at t=0
-            return initial_hydrodynamics(ini, r, 0.0);
+            return initial_hydrodynamics(ini, r, geom, 0.0);
     }
 }
 
@@ -872,7 +867,7 @@ struct initial_state_t {
             auto i = idx[0];
             auto rc = p.grid().cell_radius(i);
             auto dv = p.grid().cell_volume(i);
-            auto prim = initial_hydrodynamics(ini, rc, ini.tstart);
+            auto prim = initial_hydrodynamics(ini, rc, p.geom, ini.tstart);
             auto cons = prim_to_cons(prim);
             p.truth.cons[i] = cons * dv;
         });
@@ -1376,6 +1371,18 @@ auto initial_state(const blast::exec_context_t& ctx) -> blast::state_t {
     }));
 
     ctx.execute(patches, initial_state_t{ini});
+
+    ctx.execute(patches, cons_to_prim_t{});
+    auto p_right = patches[0].prim[0];
+    auto p_left = external_hydrodynamics(ini, patches[0].truth.r0, patches[0].geom, true);
+    // printf("%d \n", satisfies_shock_jump(p_left, p_right, 0.1));
+
+    // ctx.execute(patches, cons_to_prim_t{});
+    // auto p_left = patches[1].prim[ini.num_zones-1];
+    // auto p_right = external_hydrodynamics(ini, patches[1].truth.r1, patches[1].geom, false);
+    // printf("%d \n", satisfies_shock_jump(p_left, p_right, 0.1));
+    
+    // printf("%f, %f, %f    %f, %f, %f \n", p_left[0], p_left[1], p_left[2], p_right[0], p_right[1], p_right[2]);
 
     return {std::move(patches), ini.tstart};
 }

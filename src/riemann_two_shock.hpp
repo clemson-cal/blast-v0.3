@@ -323,4 +323,56 @@ inline auto compute_discontinuity_velocities(
     return {v_rs, v_cd, v_fs};
 }
 
+/**
+ * Result of time evolution including final positions and solution
+ */
+struct evolution_result_t {
+    double t;       // final time
+    double r_fs;    // forward shock position
+    double r_cd;    // contact discontinuity position
+    double r_rs;    // reverse shock position
+    two_shock_solution_t solution;  // final Riemann solution
+};
+
+/**
+ * Evolve the two-shock system to a final time, accounting for 1/r^2 density drop
+ *
+ * @param input   The initial input state (dl is density at r=1)
+ * @param tfinal  The final time to evolve to
+ * @return        The evolution result with final positions and solution
+ */
+inline auto evolve_two_shock(
+    const two_shock_input_t& input,
+    double tfinal
+) -> evolution_result_t {
+    double t = 1.0;
+    double r_fs = 1.0;
+    double r_cd = 1.0;
+    double r_rs = 1.0;
+
+    double dl_initial = input.dl;
+    double dt = tfinal / 100.0;
+
+    two_shock_solution_t solution;
+
+    while (t < tfinal) {
+        double dl_current = dl_initial / (r_rs * r_rs);
+
+        two_shock_input_t current_input{dl_current, input.ul, input.dr, input.ur};
+        solution = solve_two_shock(current_input);
+
+        auto velocities = compute_discontinuity_velocities(current_input, solution);
+        double v_rs = velocities[0];
+        double v_cd = velocities[1];
+        double v_fs = velocities[2];
+
+        r_fs += v_fs * dt;
+        r_cd += v_cd * dt;
+        r_rs += v_rs * dt;
+        t += dt;
+    }
+
+    return {t, r_fs, r_cd, r_rs, solution};
+}
+
 } // namespace riemann
