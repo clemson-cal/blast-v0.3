@@ -1093,11 +1093,11 @@ struct classify_patch_edges_t {
             p.e0 = et;
             p.v0 = vel;
 
-            // Compute flux at discontinuity using interior state (pR)
+            // Compute flux at discontinuity using upstream state (pL)
             if (et != edge_type::generic) {
-                auto uR = prim_to_cons(pR);
-                auto fR = prim_and_cons_to_flux(pR, uR);
-                p.discontinuity_flux_l = fR - uR * vel;
+                auto uL = prim_to_cons(pL);
+                auto fL = prim_and_cons_to_flux(pL, uL);
+                p.discontinuity_flux_l = fL - uL * vel;
             }
         }
 
@@ -1109,11 +1109,11 @@ struct classify_patch_edges_t {
             p.e1 = et;
             p.v1 = vel;
 
-            // Compute flux at discontinuity using interior state (pL)
+            // Compute flux at discontinuity using upstream state (pR)
             if (et != edge_type::generic) {
-                auto uL = prim_to_cons(pL);
-                auto fL = prim_and_cons_to_flux(pL, uL);
-                p.discontinuity_flux_r = fL - uL * vel;
+                auto uR = prim_to_cons(pR);
+                auto fR = prim_and_cons_to_flux(pR, uR);
+                p.discontinuity_flux_r = fR - uR * vel;
             }
         }
 

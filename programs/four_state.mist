@@ -2,7 +2,7 @@ set initial model=four_state
 set initial tstart=0.1
 set initial inner_radius=0.5
 set initial outer_radius=1.5
-set initial num_zones=200
+set initial num_zones=500
 set initial num_patches=2
 set initial geom=spherical
 set initial four_state_ul=+10.0
@@ -17,7 +17,7 @@ select products
 write products
 repeat 1 n show iteration
 # n += 2
-t -> 0.45
+t -> 5.0
 write products
 show profiler
 stop
