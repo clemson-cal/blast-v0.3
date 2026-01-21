@@ -371,6 +371,7 @@ static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool
     auto fR = prim_and_cons_to_flux(pR, uR);
     auto flux_L = fL - uL * v_s;
     auto flux_R = fR - uR * v_s;
+    printf("%f \n", reldiff(flux_L, flux_R));
     return reldiff(flux_L, flux_R) < shock_tol;
 }
 
@@ -690,21 +691,24 @@ static auto initial_hydrodynamics(const initial_t& ini, double r, double t) -> p
             auto dr = ini.four_state_dr;
             auto ur = ini.four_state_ur;
 
-            // Solve two-shock Riemann problem
-            auto sol = riemann::solve_two_shock(dl, ul, dr, ur);
-
-            // Compute discontinuity velocities
-            auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol);
+            // First pass: compute shock positions using planar solution
+            auto sol_planar = riemann::solve_two_shock(dl, ul, dr, ur);
+            auto [v_rs, v_cd, v_fs] = riemann::compute_discontinuity_velocities({dl, ul, dr, ur}, sol_planar);
 
             // Positions at time t (shocks launched from r=1.0)
             double r_rs = 1.0 + v_rs * t;
             double r_cd = 1.0 + v_cd * t;
             double r_fs = 1.0 + v_fs * t;
 
+            // Second pass: recompute solution with corrected upstream density at shock position
+            double dl_eff = (ini.geom == geometry::spherical) ? dl / (r_rs * r_rs) : dl;
+            auto sol = riemann::solve_two_shock(dl_eff, ul, dr, ur);
+
             // Determine which region r falls into
             if (r < r_rs) {
-                // Region 4: original left state
-                return prim_t{dl, ul, ini.cold_temp * dl};
+                // Region 4: original left state with 1/r² density profile
+                double rho = (ini.geom == geometry::spherical) ? dl / (r * r) : dl;
+                return prim_t{rho, ul, ini.cold_temp * rho};
             } else if (r < r_cd) {
                 // Region 3: shocked left material
                 return prim_t{sol.d3, sol.u, sol.p};
