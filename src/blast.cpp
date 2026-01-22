@@ -371,7 +371,7 @@ static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool
     auto fR = prim_and_cons_to_flux(pR, uR);
     auto flux_L = fL - uL * v_s;
     auto flux_R = fR - uR * v_s;
-    printf("%f \n", reldiff(flux_L, flux_R));
+    // printf("%f \n", reldiff(flux_L, flux_R));
     return reldiff(flux_L, flux_R) < shock_tol;
 }
 
@@ -559,6 +559,7 @@ struct initial_t {
     double four_state_ul = 10.0;
     double four_state_dr = 1.0;
     double four_state_ur = 0.0;
+    double four_state_delta = 0.0;  // Shell width (0 = infinite shell)
     double cold_temp = 1e-6;
 
     auto fields() const {
@@ -574,6 +575,7 @@ struct initial_t {
             field("four_state_ul", four_state_ul),
             field("four_state_dr", four_state_dr),
             field("four_state_ur", four_state_ur),
+            field("four_state_delta", four_state_delta),
             field("cold_temp", cold_temp)
         );
     }
@@ -591,6 +593,7 @@ struct initial_t {
             field("four_state_ul", four_state_ul),
             field("four_state_dr", four_state_dr),
             field("four_state_ur", four_state_ur),
+            field("four_state_delta", four_state_delta),
             field("cold_temp", cold_temp)
         );
     }
@@ -735,6 +738,8 @@ static auto initial_hydrodynamics(const initial_t& ini, double r, double t) -> p
 static auto external_hydrodynamics(
     const initial_t& ini,
     double r,
+    double t,
+    double r_rs,
     geometry geom,
     bool is_left_boundary
 ) -> prim_t {
@@ -744,7 +749,28 @@ static auto external_hydrodynamics(
                 // Region 4: unshocked ejecta with 1/r² density profile in spherical
                 auto dl = ini.four_state_dl;
                 auto ul = ini.four_state_ul;
-                double rho = (geom == geometry::spherical) ? dl / (r * r) : dl;
+                auto delta = ini.four_state_delta;
+
+                // Compute ejecta velocity from four-velocity
+                double gamma_l = std::sqrt(1.0 + ul * ul);
+                double v_ejecta = ul / gamma_l;
+
+                // Shell back position at current time (starts at r_0 - delta = 1.0 - delta)
+                double r_back = (1.0 - delta) + v_ejecta * t;
+
+                // Transition factor: 0 = full ejecta, 1 = full vacuum
+                double transition = 0.0;
+                if (delta > 0.0 && r_back > r_rs) {
+                    printf("cross\n");
+                    double ramp_width = 0.01 * delta;
+                    transition = std::min(1.0, (r_back - r_rs) / ramp_width);
+                }
+
+                // Interpolate between ejecta and vacuum
+                double rho_ejecta = (geom == geometry::spherical) ? dl / (r * r) : dl;
+                double rho_vacuum = 1e-10 * rho_ejecta;
+                double rho = rho_ejecta * (1.0 - transition) + rho_vacuum * transition;
+
                 return prim_t{rho, ul, ini.cold_temp * rho};
             } else {
                 // Region 1: unshocked ambient (uniform density)
@@ -998,7 +1024,7 @@ struct apply_prim_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i0 - 1 - g;
                         auto r = p.grid().cell_radius(i);
-                        p.prim[i] = external_hydrodynamics(ini, r, p.geom, true);
+                        p.prim[i] = external_hydrodynamics(ini, r, p.truth.time, p.truth.r0, p.geom, true);
                     }
                     break;
                 case boundary_condition::reflecting:
@@ -1022,7 +1048,7 @@ struct apply_prim_boundary_conditions_t {
                     for (int g = 0; g < 2; ++g) {
                         auto i = i1 + 1 + g;
                         auto r = p.grid().cell_radius(i);
-                        p.prim[i] = external_hydrodynamics(ini, r, p.geom, false);
+                        p.prim[i] = external_hydrodynamics(ini, r, p.truth.time, p.truth.r0, p.geom, false);
                     }
                     break;
                 case boundary_condition::reflecting:
