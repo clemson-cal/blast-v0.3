@@ -84,6 +84,15 @@ enum class edge_type {
     shock     // shock
 };
 
+auto to_string(edge_type et) -> const char* {
+    switch (et) {
+        case edge_type::generic: return "generic";
+        case edge_type::contact: return "contact";
+        case edge_type::shock: return "shock";
+    }
+    return "unknown";
+}
+
 enum class riemann_solver {
     hlle,
     hllc,
@@ -371,7 +380,7 @@ static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool
     auto fR = prim_and_cons_to_flux(pR, uR);
     auto flux_L = fL - uL * v_s;
     auto flux_R = fR - uR * v_s;
-    printf("%f \n", reldiff(flux_L, flux_R));
+    // printf("%f \n", reldiff(flux_L, flux_R));
     return reldiff(flux_L, flux_R) < shock_tol;
 }
 
@@ -1090,15 +1099,20 @@ struct classify_patch_edges_t {
 
     // Classify a single edge and return (type, velocity)
     auto classify_edge(prim_t pL, prim_t pR) const -> std::pair<edge_type, double> {
-        // Step 1: Check if states satisfy shock jump conditions
-        if (satisfies_shock_jump(pL, pR, shock_tol)) {
+        double p_L = pL[2];
+        double p_R = pR[2];
+        double rho_L = pL[0];
+        double rho_R = pR[0];
+
+        // Step 1: Pressure jump → Shock
+        if (reldiff(p_L, p_R) > shock_tol) {
             return {edge_type::shock, compute_shock_velocity(pL, pR)};
         }
-        // Step 2: Check if states satisfy contact jump conditions
-        if (satisfies_contact_jump(pL, pR, contact_tol)) {
+        // Step 2: Density jump (no pressure jump) → Contact
+        if (reldiff(rho_L, rho_R) > contact_tol) {
             return {edge_type::contact, 0.5 * (beta(pL) + beta(pR))};
         }
-        // Step 3: Otherwise generic
+        // Step 3: Neither → Generic
         return {edge_type::generic, 0.5 * (beta(pL) + beta(pR))};
     }
 
@@ -1117,6 +1131,7 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e0 = et;
             p.v0 = vel;
+            // printf("Left edge (i0=%d): %s, vel=%f\n", i0, to_string(et), vel);
 
             // Compute flux at discontinuity using upstream state (pL)
             if (et != edge_type::generic) {
@@ -1133,6 +1148,7 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e1 = et;
             p.v1 = vel;
+            // printf("Right edge (i1=%d): %s, vel=%f\n", i1, to_string(et), vel);
 
             // Compute flux at discontinuity using upstream state (pR)
             if (et != edge_type::generic) {
