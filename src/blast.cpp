@@ -286,6 +286,7 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
         p -= f / g;
     }
     if (n == newton_iter_max) {
+        printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
         throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
     }
     return prim_t{m / w0, w0 * cons[1] / (tau + m + p), p};
@@ -1131,13 +1132,17 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e0 = et;
             p.v0 = vel;
-            // printf("Left edge (i0=%d): %s, vel=%f\n", i0, to_string(et), vel);
 
-            // Compute flux at discontinuity using upstream state (pL)
-            if (et != edge_type::generic) {
+            if (et == edge_type::shock) {
+                // Shock: use upstream state (pL)
                 auto uL = prim_to_cons(pL);
                 auto fL = prim_and_cons_to_flux(pL, uL);
                 p.discontinuity_flux_l = fL - uL * vel;
+            } else if (et == edge_type::contact) {
+                // Contact: mass flux = 0, only pressure contributes
+                // F - U * v_contact = (0, p, p * v_contact) in moving frame
+                double pressure = 0.5 * (pL[2] + pR[2]);
+                p.discontinuity_flux_l = cons_t{0.0, pressure, pressure * vel};
             }
         }
 
@@ -1148,13 +1153,16 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e1 = et;
             p.v1 = vel;
-            // printf("Right edge (i1=%d): %s, vel=%f\n", i1, to_string(et), vel);
 
-            // Compute flux at discontinuity using upstream state (pR)
-            if (et != edge_type::generic) {
+            if (et == edge_type::shock) {
+                // Shock: use upstream state (pR)
                 auto uR = prim_to_cons(pR);
                 auto fR = prim_and_cons_to_flux(pR, uR);
                 p.discontinuity_flux_r = fR - uR * vel;
+            } else if (et == edge_type::contact) {
+                // Contact: mass flux = 0, only pressure contributes
+                double pressure = 0.5 * (pL[2] + pR[2]);
+                p.discontinuity_flux_r = cons_t{0.0, pressure, pressure * vel};
             }
         }
 

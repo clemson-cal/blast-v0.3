@@ -2,12 +2,12 @@ set initial model=four_state
 set initial tstart=0.1
 set initial inner_radius=0.5
 set initial outer_radius=1.5
-set initial num_zones=400
+set initial num_zones=200
 set initial num_patches=2
 set initial geom=spherical
 set initial four_state_ul=+10.0
 set initial four_state_ur=0.0
-set initial four_state_dl=10000.0
+set initial four_state_dl=1000.0
 set initial four_state_dr=1.0
 set initial four_state_delta=0.01
 set physics riemann=hllc
@@ -18,7 +18,7 @@ select products
 write products
 repeat 1 n show iteration
 # n += 2
-t -> 4.0
+t -> 1.7
 write products
 show profiler
 stop
