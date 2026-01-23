@@ -371,7 +371,7 @@ static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool
     auto fR = prim_and_cons_to_flux(pR, uR);
     auto flux_L = fL - uL * v_s;
     auto flux_R = fR - uR * v_s;
-    // printf("%f \n", reldiff(flux_L, flux_R));
+    printf("%f \n", reldiff(flux_L, flux_R));
     return reldiff(flux_L, flux_R) < shock_tol;
 }
 
@@ -761,7 +761,6 @@ static auto external_hydrodynamics(
                 // Transition factor: 0 = full ejecta, 1 = full vacuum
                 double transition = 0.0;
                 if (delta > 0.0 && r_back > r_rs) {
-                    printf("cross\n");
                     double ramp_width = 0.01 * delta;
                     transition = std::min(1.0, (r_back - r_rs) / ramp_width);
                 }

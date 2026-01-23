@@ -223,8 +223,8 @@ inline auto compute_d3(double p, double g, double u, double d4, double g4, doubl
  */
 inline auto solve_two_shock(
     const two_shock_input_t& input,
-    double u_min = -100.0,
-    double u_max = 100.0,
+    double u_min = 0.01,
+    double u_max = 10.0,
     double tol = 1e-12
 ) -> two_shock_solution_t {
     // Map input to standard region labeling:
@@ -239,8 +239,14 @@ inline auto solve_two_shock(
 
     auto f = detail::u_equation(d1, g1, u1, d4, g4, u4);
 
+    // Dynamic bracket: offset from boundaries to avoid spurious roots
+    // where f(ur)=0 or f(ul)=0 due to term1=0
+    double epsilon = 1e-6;
+    double u_lo = std::min(u1, u4) + epsilon;
+    double u_hi = std::max(u1, u4) - epsilon;
+
     // Find the root using Brent's method
-    double u = detail::brent_root(f, u_min, u_max, tol);
+    double u = detail::brent_root(f, u_lo, u_hi, tol);
     double g = std::sqrt(1.0 + u * u);
 
     // Compute pressure (same in regions 2 and 3)
@@ -259,8 +265,8 @@ inline auto solve_two_shock(
 inline auto solve_two_shock(
     double dl, double ul,
     double dr, double ur,
-    double u_min = -100.0,
-    double u_max = 100.0,
+    double u_min = 0.01,
+    double u_max = 10.0,
     double tol = 1e-12
 ) -> two_shock_solution_t {
     return solve_two_shock({dl, ul, dr, ur}, u_min, u_max, tol);
@@ -271,8 +277,8 @@ inline auto solve_two_shock(
  */
 inline auto try_solve_two_shock(
     const two_shock_input_t& input,
-    double u_min = -100.0,
-    double u_max = 100.0,
+    double u_min = 0.01,
+    double u_max = 10.0,
     double tol = 1e-12
 ) -> std::optional<two_shock_solution_t> {
     try {
