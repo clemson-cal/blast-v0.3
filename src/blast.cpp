@@ -289,6 +289,10 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
         printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
         throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
     }
+    if (p < 0.0) {
+        printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
+        throw std::runtime_error("negative pressure");
+    }
     return prim_t{m / w0, w0 * cons[1] / (tau + m + p), p};
 }
 
@@ -570,7 +574,7 @@ struct initial_t {
     double four_state_dr = 1.0;
     double four_state_ur = 0.0;
     double four_state_delta = 0.0;  // Shell width (0 = infinite shell)
-    double cold_temp = 1e-6;
+    double cold_temp = 1e-2;
 
     auto fields() const {
         return std::make_tuple(
@@ -768,19 +772,26 @@ static auto external_hydrodynamics(
                 // Shell back position at current time (starts at r_0 - delta = 1.0 - delta)
                 double r_back = (1.0 - delta) + v_ejecta * t;
 
+                printf("r_back - r_rs: %f\n", r_back - r_rs);
+
                 // Transition factor: 0 = full ejecta, 1 = full vacuum
                 double transition = 0.0;
                 if (delta > 0.0 && r_back > r_rs) {
-                    double ramp_width = 0.01 * delta;
+                    double ramp_width = 1.0 * delta;
                     transition = std::min(1.0, (r_back - r_rs) / ramp_width);
                 }
 
                 // Interpolate between ejecta and vacuum
                 double rho_ejecta = (geom == geometry::spherical) ? dl / (r * r) : dl;
-                double rho_vacuum = 1e-10 * rho_ejecta;
-                double rho = rho_ejecta * (1.0 - transition) + rho_vacuum * transition;
+                // double rho_vacuum = 1e-10 * rho_ejecta;
+                double rho = rho_ejecta;
+                // double rho = rho_ejecta * (1.0 - transition) + rho_vacuum * transition;
+                double rampdown_velocity = ul * (1.0 - transition) + 1.0 * transition;
 
-                return prim_t{rho, ul, ini.cold_temp * rho};
+                printf("Quiescent state: %f, %f, %f\n", rho, rampdown_velocity, ini.cold_temp * rho);
+
+                // return prim_t{rho, ul, ini.cold_temp * rho};
+                return prim_t{rho, rampdown_velocity, ini.cold_temp * rho};
             } else {
                 // Region 1: unshocked ambient (uniform density)
                 auto dr = ini.four_state_dr;
@@ -1107,13 +1118,16 @@ struct classify_patch_edges_t {
 
         // Step 1: Pressure jump → Shock
         if (reldiff(p_L, p_R) > shock_tol) {
+            printf("%s\n", "shock");
             return {edge_type::shock, compute_shock_velocity(pL, pR)};
         }
         // Step 2: Density jump (no pressure jump) → Contact
         if (reldiff(rho_L, rho_R) > contact_tol) {
+            printf("%s\n", "contact");
             return {edge_type::contact, 0.5 * (beta(pL) + beta(pR))};
         }
         // Step 3: Neither → Generic
+        printf("%s\n", "generic");
         return {edge_type::generic, 0.5 * (beta(pL) + beta(pR))};
     }
 
