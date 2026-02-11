@@ -285,6 +285,7 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
         }
         p -= f / g;
     }
+    printf("%f\n", p);
     if (n == newton_iter_max) {
         printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
         throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
@@ -397,6 +398,73 @@ static auto satisfies_contact_jump(prim_t pL, prim_t pR, double contact_tol) -> 
     auto pL_pressure = pL[2];
     auto pR_pressure = pR[2];
     return reldiff(vL, vR) < contact_tol && reldiff(pL_pressure, pR_pressure) < contact_tol;
+}
+
+// Check if ΔF/ΔU is uniform across all components (Rankine-Hugoniot condition)
+// Returns {is_uniform, wave_velocity}
+// Both shocks and contacts satisfy R-H conditions; they differ in whether
+// the wave velocity equals the particle velocity (contact) or not (shock)
+static auto check_jump_condition_uniformity(prim_t pL, prim_t pR, double tol)
+    -> std::pair<bool, double>
+{
+    using std::fabs;
+    using std::max;
+    using std::isnan;
+
+    auto uL = prim_to_cons(pL);
+    auto uR = prim_to_cons(pR);
+    auto fL = prim_and_cons_to_flux(pL, uL);
+    auto fR = prim_and_cons_to_flux(pR, uR);
+
+    constexpr double epsilon = 1e-14;
+
+    // Compute scale for determining numerically small jumps
+    // Use a small fraction of U_scale to catch only truly degenerate cases
+    double U_scale = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        U_scale = max(U_scale, fabs(uL[i]) + fabs(uR[i]));
+    }
+    // threshold should be small enough to only filter numerical noise
+    double threshold = 1e-10 * U_scale + epsilon;
+
+    // Compute λ_i = ΔF_i / ΔU_i only for components with significant jumps
+    double lambda[3];
+    int num_valid = 0;
+    double lambda_sum = 0.0;
+
+    for (int i = 0; i < 3; ++i) {
+        double dU = uR[i] - uL[i];
+        double dF = fR[i] - fL[i];
+
+        if (fabs(dU) > threshold) {
+            // Significant jump - include in uniformity check
+            lambda[i] = dF / dU;
+            lambda_sum += lambda[i];
+            num_valid++;
+        } else {
+            // Small jump - mark as invalid for uniformity check
+            lambda[i] = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    // Need at least 2 valid components to check uniformity
+    if (num_valid < 2) {
+        return {false, 0.0};  // Not enough data to determine discontinuity
+    }
+
+    // Check uniformity among valid components
+    double avg = lambda_sum / num_valid;
+    double max_dev = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        if (!isnan(lambda[i])) {
+            max_dev = max(max_dev, fabs(lambda[i] - avg));
+        }
+    }
+
+    double scale = fabs(avg) + epsilon;
+    bool is_uniform = (max_dev / scale) < tol;
+
+    return {is_uniform, avg};
 }
 
 // =============================================================================
@@ -1110,23 +1178,31 @@ struct classify_patch_edges_t {
     double contact_tol;  // tolerance for contact jump condition check
 
     // Classify a single edge and return (type, velocity)
+    // Uses Rankine-Hugoniot conditions: both shocks and contacts have uniform ΔF/ΔU
+    // Shocks: p_L ≠ p_R (pressure jumps)
+    // Contacts: p_L ≈ p_R (pressure continuous, only density jumps)
     auto classify_edge(prim_t pL, prim_t pR) const -> std::pair<edge_type, double> {
-        double p_L = pL[2];
-        double p_R = pR[2];
-        double rho_L = pL[0];
-        double rho_R = pR[0];
+        // Step 1: Check if Rankine-Hugoniot conditions are satisfied (ΔF/ΔU uniform)
+        auto [is_discontinuity, wave_vel] = check_jump_condition_uniformity(pL, pR, shock_tol);
 
-        // Step 1: Pressure jump → Shock
-        if (reldiff(p_L, p_R) > shock_tol) {
-            printf("%s\n", "shock");
-            return {edge_type::shock, compute_shock_velocity(pL, pR)};
+        if (is_discontinuity) {
+            // Use pressure (prim[2]) for comparison
+            double p_L = pL[2];
+            double p_R = pR[2];
+
+            // Step 2: Distinguish shock vs contact by comparing pressures
+            // Contact: p_L ≈ p_R (pressure continuous across interface)
+            // Shock: p_L ≠ p_R (pressure jumps across shock)
+            if (reldiff(p_L, p_R) < contact_tol) {
+                printf("%s\n", "contact");
+                return {edge_type::contact, wave_vel};
+            } else {
+                printf("%s\n", "shock");
+                return {edge_type::shock, wave_vel};
+            }
         }
-        // Step 2: Density jump (no pressure jump) → Contact
-        if (reldiff(rho_L, rho_R) > contact_tol) {
-            printf("%s\n", "contact");
-            return {edge_type::contact, 0.5 * (beta(pL) + beta(pR))};
-        }
-        // Step 3: Neither → Generic
+
+        // Step 3: Not a discontinuity → Generic
         printf("%s\n", "generic");
         return {edge_type::generic, 0.5 * (beta(pL) + beta(pR))};
     }
