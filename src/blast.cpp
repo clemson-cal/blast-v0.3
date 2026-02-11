@@ -574,7 +574,7 @@ struct initial_t {
     double four_state_dr = 1.0;
     double four_state_ur = 0.0;
     double four_state_delta = 0.0;  // Shell width (0 = infinite shell)
-    double cold_temp = 1e-2;
+    double cold_temp = 1e-6;
 
     auto fields() const {
         return std::make_tuple(
