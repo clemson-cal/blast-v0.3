@@ -285,7 +285,7 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
         }
         p -= f / g;
     }
-    printf("%f\n", p);
+    // printf("%f\n", p);
     if (n == newton_iter_max) {
         printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
         throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
@@ -355,116 +355,46 @@ static auto reldiff(cons_t a, cons_t b) -> double {
     return diff / scale;
 }
 
-// Compute shock velocity using mass flux conservation
-// v_s = (ρ_R γ_R β_R - ρ_L γ_L β_L) / (ρ_R γ_R - ρ_L γ_L)
-static auto compute_shock_velocity(prim_t pL, prim_t pR) -> double {
-    using std::sqrt;
-
-    double rho_L = pL[0];
-    double u_L = pL[1];
-    double gamma_L = sqrt(1.0 + u_L * u_L);
-    double beta_L = u_L / gamma_L;
-
-    double rho_R = pR[0];
-    double u_R = pR[1];
-    double gamma_R = sqrt(1.0 + u_R * u_R);
-    double beta_R = u_R / gamma_R;
-
-    double rho_gamma_L = rho_L * gamma_L;
-    double rho_gamma_R = rho_R * gamma_R;
-
-    return (rho_gamma_R * beta_R - rho_gamma_L * beta_L) / (rho_gamma_R - rho_gamma_L);
+static auto dot(cons_t a, cons_t b) -> double {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-// Check if states satisfy shock jump conditions (Rankine-Hugoniot)
-// Returns true if F_L - v_s * U_L ~ F_R - v_s * U_R
-static auto satisfies_shock_jump(prim_t pL, prim_t pR, double shock_tol) -> bool {
-    auto v_s = compute_shock_velocity(pL, pR);
-    auto uL = prim_to_cons(pL);
-    auto uR = prim_to_cons(pR);
-    auto fL = prim_and_cons_to_flux(pL, uL);
-    auto fR = prim_and_cons_to_flux(pR, uR);
-    auto flux_L = fL - uL * v_s;
-    auto flux_R = fR - uR * v_s;
-    // printf("%f \n", reldiff(flux_L, flux_R));
-    return reldiff(flux_L, flux_R) < shock_tol;
-}
-
-// Check if states satisfy contact discontinuity conditions
-// Returns true if v_L ~ v_R and p_L ~ p_R
-static auto satisfies_contact_jump(prim_t pL, prim_t pR, double contact_tol) -> bool {
-    auto vL = beta(pL);
-    auto vR = beta(pR);
-    auto pL_pressure = pL[2];
-    auto pR_pressure = pR[2];
-    return reldiff(vL, vR) < contact_tol && reldiff(pL_pressure, pR_pressure) < contact_tol;
-}
-
-// Check if ΔF/ΔU is uniform across all components (Rankine-Hugoniot condition)
-// Returns {is_uniform, wave_velocity}
-// Both shocks and contacts satisfy R-H conditions; they differ in whether
-// the wave velocity equals the particle velocity (contact) or not (shock)
-static auto check_jump_condition_uniformity(prim_t pL, prim_t pR, double tol)
+// Check if ΔF and ΔU vectors are aligned (Rankine-Hugoniot condition)
+// Uses cosine similarity: cos(θ) = (ΔF · ΔU) / (|ΔF| * |ΔU|)
+// Returns {is_discontinuity, shock_speed}
+static auto check_vector_alignment(prim_t pL, prim_t pR, double epsilon_disc)
     -> std::pair<bool, double>
 {
-    using std::fabs;
-    using std::max;
-    using std::isnan;
-
     auto uL = prim_to_cons(pL);
     auto uR = prim_to_cons(pR);
     auto fL = prim_and_cons_to_flux(pL, uL);
     auto fR = prim_and_cons_to_flux(pR, uR);
 
+    // Compute ΔF and ΔU
+    cons_t dU = uR - uL;
+    cons_t dF = fR - fL;
+
+    // Compute dot products
+    double dF_dot_dU = dot(dF, dU);
+    double dU_dot_dU = dot(dU, dU);
+    double dF_dot_dF = dot(dF, dF);
+
+    // Handle degenerate case (no jump)
     constexpr double epsilon = 1e-14;
-
-    // Compute scale for determining numerically small jumps
-    // Use a small fraction of U_scale to catch only truly degenerate cases
-    double U_scale = 0.0;
-    for (int i = 0; i < 3; ++i) {
-        U_scale = max(U_scale, fabs(uL[i]) + fabs(uR[i]));
-    }
-    // threshold should be small enough to only filter numerical noise
-    double threshold = 1e-10 * U_scale + epsilon;
-
-    // Compute λ_i = ΔF_i / ΔU_i only for components with significant jumps
-    double lambda[3];
-    int num_valid = 0;
-    double lambda_sum = 0.0;
-
-    for (int i = 0; i < 3; ++i) {
-        double dU = uR[i] - uL[i];
-        double dF = fR[i] - fL[i];
-
-        if (fabs(dU) > threshold) {
-            // Significant jump - include in uniformity check
-            lambda[i] = dF / dU;
-            lambda_sum += lambda[i];
-            num_valid++;
-        } else {
-            // Small jump - mark as invalid for uniformity check
-            lambda[i] = std::numeric_limits<double>::quiet_NaN();
-        }
+    if (dU_dot_dU < epsilon || dF_dot_dF < epsilon) {
+        return {false, 0.0};
     }
 
-    // Need at least 2 valid components to check uniformity
-    if (num_valid < 2) {
-        return {false, 0.0};  // Not enough data to determine discontinuity
-    }
+    // Cosine similarity: cos(θ) = (ΔF · ΔU) / (|ΔF| * |ΔU|)
+    double cos_theta = dF_dot_dU / std::sqrt(dF_dot_dF * dU_dot_dU);
 
-    // Check uniformity among valid components
-    double avg = lambda_sum / num_valid;
-    double max_dev = 0.0;
-    for (int i = 0; i < 3; ++i) {
-        if (!isnan(lambda[i])) {
-            max_dev = max(max_dev, fabs(lambda[i] - avg));
-        }
-    }
+    // Check alignment: 1 - cos(θ) < ε_disc
+    bool is_discontinuity = (1.0 - cos_theta) < epsilon_disc;
 
-    double scale = fabs(avg) + epsilon;
-    bool is_uniform = (max_dev / scale) < tol;
+    // Shock speed from least-squares: s = (ΔF · ΔU) / (ΔU · ΔU)
+    double shock_speed = dF_dot_dU / dU_dot_dU;
 
-    return {is_uniform, avg};
+    return {is_discontinuity, shock_speed};
 }
 
 // =============================================================================
@@ -1174,35 +1104,35 @@ struct compute_gradients_t {
 
 struct classify_patch_edges_t {
     static constexpr const char* name = "classify_edges";
-    double shock_tol;    // tolerance for shock jump condition check
-    double contact_tol;  // tolerance for contact jump condition check
+    double epsilon_disc;  // tolerance for discontinuity detection (vector alignment)
+    double contact_tol;   // tolerance for contact vs shock distinction
 
     // Classify a single edge and return (type, velocity)
-    // Uses Rankine-Hugoniot conditions: both shocks and contacts have uniform ΔF/ΔU
-    // Shocks: p_L ≠ p_R (pressure jumps)
-    // Contacts: p_L ≈ p_R (pressure continuous, only density jumps)
+    // Uses vector alignment: cos(θ) = (ΔF · ΔU) / (|ΔF| * |ΔU|)
+    // Shocks: p_L ≠ p_R (pressure jumps), speed from least-squares
+    // Contacts: p_L ≈ p_R (pressure continuous), speed from average velocity
     auto classify_edge(prim_t pL, prim_t pR) const -> std::pair<edge_type, double> {
-        // Step 1: Check if Rankine-Hugoniot conditions are satisfied (ΔF/ΔU uniform)
-        auto [is_discontinuity, wave_vel] = check_jump_condition_uniformity(pL, pR, shock_tol);
+        // Step 1: Check if ΔF and ΔU are aligned (R-H condition)
+        auto [is_discontinuity, shock_speed] = check_vector_alignment(pL, pR, epsilon_disc);
 
         if (is_discontinuity) {
-            // Use pressure (prim[2]) for comparison
+            // Step 2: Distinguish shock vs contact by pressure
             double p_L = pL[2];
             double p_R = pR[2];
 
-            // Step 2: Distinguish shock vs contact by comparing pressures
-            // Contact: p_L ≈ p_R (pressure continuous across interface)
-            // Shock: p_L ≠ p_R (pressure jumps across shock)
             if (reldiff(p_L, p_R) < contact_tol) {
+                // Contact: use average velocity
+                double avg_vel = 0.5 * (beta(pL) + beta(pR));
                 printf("%s\n", "contact");
-                return {edge_type::contact, wave_vel};
+                return {edge_type::contact, avg_vel};
             } else {
+                // Shock: use least-squares speed
                 printf("%s\n", "shock");
-                return {edge_type::shock, wave_vel};
+                return {edge_type::shock, shock_speed};
             }
         }
 
-        // Step 3: Not a discontinuity → Generic
+        // Generic: use average velocity
         printf("%s\n", "generic");
         return {edge_type::generic, 0.5 * (beta(pL) + beta(pR))};
     }
@@ -1399,7 +1329,7 @@ struct blast {
         boundary_condition bc_lo = boundary_condition::outflow;
         boundary_condition bc_hi = boundary_condition::outflow;
         riemann_solver riemann = riemann_solver::hllc;
-        double shock_tol = 0.0;
+        double epsilon_disc = 0.0;
         double contact_tol = 0.0;
 
         auto fields() const {
@@ -1410,7 +1340,7 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("shock_tol", shock_tol),
+                field("epsilon_disc", epsilon_disc),
                 field("contact_tol", contact_tol)
             );
         }
@@ -1423,7 +1353,7 @@ struct blast {
                 field("bc_lo", bc_lo),
                 field("bc_hi", bc_hi),
                 field("riemann", riemann),
-                field("shock_tol", shock_tol),
+                field("epsilon_disc", epsilon_disc),
                 field("contact_tol", contact_tol)
             );
         }
@@ -1484,7 +1414,7 @@ auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
         .bc_lo = boundary_condition::outflow,
         .bc_hi = boundary_condition::outflow,
         .riemann = riemann_solver::hllc,
-        .shock_tol = 0.1,
+        .epsilon_disc = 0.1,
         .contact_tol = 0.1
     };
 }
@@ -1539,7 +1469,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         exchange_prim_guard_t{},
         apply_prim_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini},
         compute_gradients_t{},
-        classify_patch_edges_t{cfg.shock_tol, cfg.contact_tol},
+        classify_patch_edges_t{cfg.epsilon_disc, cfg.contact_tol},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );
