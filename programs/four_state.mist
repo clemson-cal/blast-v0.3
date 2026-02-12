@@ -18,7 +18,7 @@ select products
 write products
 repeat 1 n show iteration
 # n += 2
-t -> 2.5
+t -> 2.3
 write products
 show profiler
 stop

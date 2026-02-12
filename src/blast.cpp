@@ -1414,7 +1414,7 @@ auto default_physics_config(std::type_identity<blast>) -> blast::config_t {
         .bc_lo = boundary_condition::outflow,
         .bc_hi = boundary_condition::outflow,
         .riemann = riemann_solver::hllc,
-        .epsilon_disc = 0.1,
+        .epsilon_disc = 1.0e-10,
         .contact_tol = 0.1
     };
 }
