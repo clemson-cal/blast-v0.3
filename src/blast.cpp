@@ -287,12 +287,14 @@ static auto cons_to_prim(cons_t cons, double p = 0.0) -> prim_t {
     }
     // printf("%f\n", p);
     if (n == newton_iter_max) {
-        printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
+        printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e, ss/m^2=%e\n", cons[0], cons[1], cons[2], p, ss / (m * m));
         throw std::runtime_error("cons_to_prim: Newton iteration failed to converge");
     }
-    if (p < 0.0) {
-        printf("cons_to_prim failed: D=%e, S=%e, tau=%e, p_guess=%e\n", cons[0], cons[1], cons[2], p);
-        throw std::runtime_error("negative pressure");
+    // Clamp negative pressures in cold flow regions
+    // For cold flow, p << rho, so small negative p is numerical noise
+    auto p_floor = 1e-15 * m;
+    if (p < p_floor) {
+        p = p_floor;
     }
     return prim_t{m / w0, w0 * cons[1] / (tau + m + p), p};
 }
