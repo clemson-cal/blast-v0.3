@@ -1540,7 +1540,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
 
     if (first_call) {
         edge_file.open("edge_diagnostics.csv");
-        edge_file << "time,edge0_err,edge1_err,edge2_err,u_bc,v_edge0,u_interior\n";
+        edge_file << "time,edge0_err,edge1_err,edge2_err,u_bc,v_edge0,u_interior,p_exterior,p_interior\n";
         first_call = false;
     }
     if (state.time >= last_write_time + write_interval || last_write_time < 0.0) {
@@ -1551,12 +1551,15 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         // Inner edge diagnostics
         auto& p0 = state.patches[0];
         auto i0 = start(p0.space)[0];
-        double u_bc = p0.prim[i0 - 1][1];      // four-velocity of BC fluid (ghost zone)
-        double v_edge0 = p0.v0;                 // mesh velocity at inner edge
-        double u_interior = p0.prim[i0][1];    // four-velocity just inside domain
+        double u_bc = p0.prim[i0 - 1][1];       // four-velocity of BC fluid (ghost zone)
+        double v_edge0 = p0.v0;                  // mesh velocity at inner edge
+        double u_interior = p0.prim[i0][1];     // four-velocity just inside domain
+        double p_exterior = p0.prim[i0 - 1][2]; // pressure exterior (ghost zone)
+        double p_interior = p0.prim[i0][2];     // pressure interior (first cell)
 
         edge_file << state.time << "," << edge0_err << "," << edge1_err << "," << edge2_err
-                  << "," << u_bc << "," << v_edge0 << "," << u_interior << "\n";
+                  << "," << u_bc << "," << v_edge0 << "," << u_interior
+                  << "," << p_exterior << "," << p_interior << "\n";
         edge_file.flush();
         last_write_time = state.time;
     }
