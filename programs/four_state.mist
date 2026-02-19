@@ -13,7 +13,7 @@ set initial four_state_delta=0.01
 set physics riemann=hllc
 set physics bc_lo=inflow
 set physics bc_hi=inflow
-set physics epsilon_disc=1.0E-12
+set physics epsilon_disc=1.0E-10
 init
 select products
 write products

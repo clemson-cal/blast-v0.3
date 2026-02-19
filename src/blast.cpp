@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include <cassert>
 #include <cmath>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -397,6 +398,30 @@ static auto check_vector_alignment(prim_t pL, prim_t pR, double epsilon_disc)
     double shock_speed = dF_dot_dU / dU_dot_dU;
 
     return {is_discontinuity, shock_speed};
+}
+
+// Compute alignment error (1 - cos_theta) for Rankine-Hugoniot condition
+// Returns a value in [0, 2]: 0 = perfectly aligned, 2 = anti-aligned
+static auto alignment_error(prim_t pL, prim_t pR) -> double {
+    auto uL = prim_to_cons(pL);
+    auto uR = prim_to_cons(pR);
+    auto fL = prim_and_cons_to_flux(pL, uL);
+    auto fR = prim_and_cons_to_flux(pR, uR);
+
+    cons_t dU = uR - uL;
+    cons_t dF = fR - fL;
+
+    double dF_dot_dU = dot(dF, dU);
+    double dU_dot_dU = dot(dU, dU);
+    double dF_dot_dF = dot(dF, dF);
+
+    constexpr double epsilon = 1e-14;
+    if (dU_dot_dU < epsilon || dF_dot_dF < epsilon) {
+        return 0.0;  // No jump, considered perfectly aligned
+    }
+
+    double cos_theta = dF_dot_dU / std::sqrt(dF_dot_dF * dU_dot_dU);
+    return 1.0 - cos_theta;
 }
 
 // =============================================================================
@@ -843,6 +868,8 @@ struct patch_t {
     mutable double v1 = 0.0;
     mutable edge_type e0 = edge_type::generic;
     mutable edge_type e1 = edge_type::generic;
+    mutable double err0 = 0.0;  // RH alignment error at left edge
+    mutable double err1 = 0.0;  // RH alignment error at right edge
     mutable std::optional<cons_t> discontinuity_flux_l;
     mutable std::optional<cons_t> discontinuity_flux_r;
 
@@ -1157,6 +1184,7 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e0 = et;
             p.v0 = vel;
+            p.err0 = alignment_error(pL, pR);
 
             if (et == edge_type::shock) {
                 // Shock: use upstream state (pL)
@@ -1178,6 +1206,7 @@ struct classify_patch_edges_t {
             auto [et, vel] = classify_edge(pL, pR);
             p.e1 = et;
             p.v1 = vel;
+            p.err1 = alignment_error(pL, pR);
 
             if (et == edge_type::shock) {
                 // Shock: use upstream state (pR)
@@ -1502,6 +1531,26 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
     }
 
     state.time = state.patches[0].truth.time;
+
+    // Write edge diagnostics to a single CSV file
+    static std::ofstream edge_file;
+    static bool first_call = true;
+    static double last_write_time = -1.0;
+    constexpr double write_interval = 0.002;
+
+    if (first_call) {
+        edge_file.open("edge_diagnostics.csv");
+        edge_file << "time,edge0_err,edge1_err,edge2_err\n";
+        first_call = false;
+    }
+    if (state.time >= last_write_time + write_interval || last_write_time < 0.0) {
+        double edge0_err = state.patches[0].err0;
+        double edge1_err = state.patches[0].err1;
+        double edge2_err = state.patches.size() > 1 ? state.patches[1].err1 : 0.0;
+        edge_file << state.time << "," << edge0_err << "," << edge1_err << "," << edge2_err << "\n";
+        edge_file.flush();
+        last_write_time = state.time;
+    }
 }
 
 auto zone_count(const blast::state_t& state, const blast::exec_context_t& ctx) -> std::size_t {
