@@ -775,10 +775,13 @@ static auto external_hydrodynamics(
                 printf("r_back - r_rs: %f\n", r_back - r_rs);
 
                 // Transition factor: 0 = full ejecta, 1 = full vacuum
+                // Uses sin^2 for smooth (C1) transition at both endpoints
                 double transition = 0.0;
                 if (delta > 0.0 && r_back > r_rs) {
                     double ramp_width = 1.0 * delta;
-                    transition = std::min(1.0, (r_back - r_rs) / ramp_width);
+                    double linear_t = std::min(1.0, (r_back - r_rs) / ramp_width);
+                    double sin_val = std::sin(linear_t * M_PI / 2.0);
+                    transition = sin_val * sin_val;
                 }
 
                 // Interpolate between ejecta and vacuum
