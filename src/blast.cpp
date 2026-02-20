@@ -1057,14 +1057,18 @@ struct apply_prim_boundary_conditions_t {
     boundary_condition bc_lo;
     boundary_condition bc_hi;
     initial_t ini;
+    bool reverse_shock_dead = false;
 
     auto value(patch_t p) const -> patch_t {
         auto i0 = start(p.space)[0];
         auto i1 = upper(p.space)[0] - 1;
 
+        // Switch to outflow when reverse shock is dead
+        auto effective_bc_lo = reverse_shock_dead ? boundary_condition::outflow : bc_lo;
+
         // Left boundary (patch starts at global origin)
         if (i0 == 0) {
-            switch (bc_lo) {
+            switch (effective_bc_lo) {
                 case boundary_condition::outflow:
                     for (int g = 0; g < 2; ++g) {
                         p.prim[i0 - 1 - g] = p.prim[i0];
@@ -1108,6 +1112,25 @@ struct apply_prim_boundary_conditions_t {
                     }
                     break;
             }
+        }
+        return p;
+    }
+};
+
+struct handle_rs_death_edges_t {
+    static constexpr const char* name = "handle_rs_death";
+    bool reverse_shock_dead;
+
+    auto value(patch_t p) const -> patch_t {
+        if (!reverse_shock_dead) return p;
+
+        auto i0 = start(p.space)[0];
+        // Only affect innermost patch's inner edge
+        if (i0 == 0) {
+            // Override edge type to generic (prevents shock flux computation)
+            p.e0 = edge_type::generic;
+            // Set mesh velocity to fluid velocity (coordinate velocity beta, not four-velocity)
+            p.v0 = beta(p.prim[i0]);
         }
         return p;
     }
@@ -1321,6 +1344,33 @@ struct rk_average_t {
     }
 };
 
+// Detect reverse shock death by comparing boundary condition velocity to interior velocity
+// Returns true if RS is newly detected as dead this step
+static auto detect_reverse_shock_death(
+    const std::vector<patch_t>& patches,
+    const initial_t& ini,
+    boundary_condition bc_lo
+) -> bool {
+    // Only relevant for four_state model with inflow BC
+    if (ini.model != external_model::four_state) return false;
+    if (bc_lo != boundary_condition::inflow) return false;
+    if (patches.empty()) return false;
+
+    const auto& p0 = patches[0];
+    auto i0 = start(p0.space)[0];
+
+    // Only check if this is the global inner boundary
+    if (i0 != 0) return false;
+
+    // Get four-velocities
+    double u_bc = p0.prim[i0 - 1][1];       // four-velocity in ghost zone (from external_hydrodynamics)
+    double u_interior = p0.prim[i0][1];      // four-velocity in first interior cell
+
+    // RS death condition: inflow velocity <= interior velocity
+    // This means the upstream ejecta is no longer "catching up" to the shocked material
+    return u_bc <= u_interior;
+}
+
 // =============================================================================
 // Serialization
 // =============================================================================
@@ -1398,18 +1448,21 @@ struct blast {
     struct state_t {
         std::vector<patch_t> patches;
         double time;
+        bool reverse_shock_dead = false;
 
         auto fields() const {
             return std::make_tuple(
                 field("patches", patches),
-                field("time", time)
+                field("time", time),
+                field("reverse_shock_dead", reverse_shock_dead)
             );
         }
 
         auto fields() {
             return std::make_tuple(
                 field("patches", patches),
-                field("time", time)
+                field("time", time),
+                field("reverse_shock_dead", reverse_shock_dead)
             );
         }
     };
@@ -1501,8 +1554,9 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
     auto euler_step = parallel::pipeline(
         cons_to_prim_t{},
         exchange_prim_guard_t{},
-        apply_prim_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini},
+        apply_prim_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini, state.reverse_shock_dead},
         compute_gradients_t{},
+        handle_rs_death_edges_t{state.reverse_shock_dead},
         classify_patch_edges_t{cfg.epsilon_disc, cfg.contact_tol},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
@@ -1531,6 +1585,14 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
     }
 
     state.time = state.patches[0].truth.time;
+
+    // Detect reverse shock death (only check if not already dead)
+    if (!state.reverse_shock_dead) {
+        if (detect_reverse_shock_death(state.patches, ini, cfg.bc_lo)) {
+            state.reverse_shock_dead = true;
+            printf("=== REVERSE SHOCK DEATH DETECTED at t = %f ===\n", state.time);
+        }
+    }
 
     // Write edge diagnostics to a single CSV file
     static std::ofstream edge_file;
