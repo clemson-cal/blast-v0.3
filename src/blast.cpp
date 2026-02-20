@@ -1131,6 +1131,8 @@ struct handle_rs_death_edges_t {
             p.e0 = edge_type::generic;
             // Set mesh velocity to fluid velocity (coordinate velocity beta, not four-velocity)
             p.v0 = beta(p.prim[i0]);
+            // Set zero flux at inner boundary (pure zero-flux, no mass/momentum/energy transfer)
+            p.discontinuity_flux_l = cons_t{0.0, 0.0, 0.0};
         }
         return p;
     }
@@ -1556,8 +1558,8 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         exchange_prim_guard_t{},
         apply_prim_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini, state.reverse_shock_dead},
         compute_gradients_t{},
-        handle_rs_death_edges_t{state.reverse_shock_dead},
         classify_patch_edges_t{cfg.epsilon_disc, cfg.contact_tol},
+        handle_rs_death_edges_t{state.reverse_shock_dead},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
     );
