@@ -1159,6 +1159,63 @@ struct compute_gradients_t {
     }
 };
 
+struct correct_contact_gradients_t {
+    static constexpr const char* name = "correct_contact_grads";
+
+    auto value(patch_t p) const -> patch_t {
+        auto i0 = start(p.space)[0];
+        auto i1 = upper(p.space)[0];
+
+        // Correct gradients at left edge if it's a contact
+        if (p.e0 == edge_type::contact) {
+            auto pL = p.prim[i0 - 1];
+            auto pR = p.prim[i0];
+
+            // Common velocity (coordinate velocity beta) and pressure
+            double v_c = 0.5 * (beta(pL) + beta(pR));
+            double p_c = 0.5 * (pL[2] + pR[2]);
+
+            // Convert common coordinate velocity to four-velocity
+            double u_c = v_c / std::sqrt(1.0 - v_c * v_c);
+
+            // Modify gradient in ghost cell (i0-1) so pL reconstruction gives common values
+            // pL_reconstructed = prim[i0-1] + grad[i0-1] * 0.5 = target
+            // grad[i0-1] = 2 * (target - prim[i0-1])
+            p.grad[i0 - 1][1] = 2.0 * (u_c - pL[1]);   // velocity
+            p.grad[i0 - 1][2] = 2.0 * (p_c - pL[2]);   // pressure
+
+            // Modify gradient in interior cell (i0) so pR reconstruction gives common values
+            // pR_reconstructed = prim[i0] - grad[i0] * 0.5 = target
+            // grad[i0] = 2 * (prim[i0] - target)
+            p.grad[i0][1] = 2.0 * (pR[1] - u_c);       // velocity
+            p.grad[i0][2] = 2.0 * (pR[2] - p_c);       // pressure
+        }
+
+        // Correct gradients at right edge if it's a contact
+        if (p.e1 == edge_type::contact) {
+            auto pL = p.prim[i1 - 1];
+            auto pR = p.prim[i1];
+
+            // Common velocity (coordinate velocity beta) and pressure
+            double v_c = 0.5 * (beta(pL) + beta(pR));
+            double p_c = 0.5 * (pL[2] + pR[2]);
+
+            // Convert common coordinate velocity to four-velocity
+            double u_c = v_c / std::sqrt(1.0 - v_c * v_c);
+
+            // Modify gradient in interior cell (i1-1) so pL reconstruction gives common values
+            p.grad[i1 - 1][1] = 2.0 * (u_c - pL[1]);   // velocity
+            p.grad[i1 - 1][2] = 2.0 * (p_c - pL[2]);   // pressure
+
+            // Modify gradient in ghost cell (i1) so pR reconstruction gives common values
+            p.grad[i1][1] = 2.0 * (pR[1] - u_c);       // velocity
+            p.grad[i1][2] = 2.0 * (pR[2] - p_c);       // pressure
+        }
+
+        return p;
+    }
+};
+
 struct classify_patch_edges_t {
     static constexpr const char* name = "classify_edges";
     double epsilon_disc;  // tolerance for discontinuity detection (vector alignment)
@@ -1559,6 +1616,7 @@ void advance(blast::state_t& state, const blast::exec_context_t& ctx, double dt_
         apply_prim_boundary_conditions_t{cfg.bc_lo, cfg.bc_hi, ini, state.reverse_shock_dead},
         compute_gradients_t{},
         classify_patch_edges_t{cfg.epsilon_disc, cfg.contact_tol},
+        correct_contact_gradients_t{},
         handle_rs_death_edges_t{state.reverse_shock_dead},
         compute_fluxes_t{cfg.riemann},
         update_conserved_t{}
